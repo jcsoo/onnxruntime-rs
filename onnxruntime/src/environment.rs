@@ -6,7 +6,7 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use onnxruntime_sys as sys;
 
@@ -157,11 +157,6 @@ impl Environment {
 impl Drop for Environment {
     #[tracing::instrument]
     fn drop(&mut self) {
-        debug!(
-            global_arc_count = Arc::strong_count(&G_ENV),
-            "Dropping the Environment.",
-        );
-
         let mut environment_guard = self
             .env
             .lock()
@@ -173,19 +168,12 @@ impl Drop for Environment {
         //       If there is no other environment, the strong count should be two and we
         //       can properly free the sys::OrtEnv pointer.
         if Arc::strong_count(&G_ENV) == 2 {
-            let release_env = g_ort().ReleaseEnv.unwrap();
             let env_ptr: *mut sys::OrtEnv = *environment_guard.env_ptr.get_mut();
-
-            debug!(
-                global_arc_count = Arc::strong_count(&G_ENV),
-                "Releasing the Environment.",
-            );
-
-            assert_ne!(env_ptr, std::ptr::null_mut());
             if env_ptr.is_null() {
-                error!("Environment pointer is null, not dropping!");
+                error!("Environment pointer is null, not dropping");
             } else {
-                unsafe { release_env(env_ptr) };
+                trace!("Dropping Environment.");
+                unsafe { g_ort().ReleaseEnv.unwrap()(env_ptr) };
             }
 
             environment_guard.env_ptr = AtomicPtr::new(std::ptr::null_mut());
@@ -243,7 +231,7 @@ impl EnvBuilder {
 mod tests {
     use super::*;
     use std::sync::{RwLock, RwLockWriteGuard};
-    use test_env_log::test;
+    use test_log::test;
 
     impl G_ENV {
         fn is_initialized(&self) -> bool {
@@ -328,28 +316,25 @@ mod tests {
         let main_env = Environment::new(initial_name.clone(), LoggingLevel::Warning).unwrap();
         let main_env_ptr = main_env.env_ptr() as usize;
 
-        let children: Vec<_> = (0..10)
-            .map(|t| {
-                let initial_name_cloned = initial_name.clone();
-                std::thread::spawn(move || {
-                    let name = format!("concurrent_environment_creation: {}", t);
-                    let env = Environment::builder()
-                        .with_name(name)
-                        .with_log_level(LoggingLevel::Warning)
-                        .build()
-                        .unwrap();
+        let children = (0..10).map(|t| {
+            let initial_name_cloned = initial_name.clone();
+            std::thread::spawn(move || {
+                let name = format!("concurrent_environment_creation: {}", t);
+                let env = Environment::builder()
+                    .with_name(name)
+                    .with_log_level(LoggingLevel::Warning)
+                    .build()
+                    .unwrap();
 
-                    assert_eq!(env.name(), initial_name_cloned);
-                    assert_eq!(env.env_ptr() as usize, main_env_ptr);
-                })
+                assert_eq!(env.name(), initial_name_cloned);
+                assert_eq!(env.env_ptr() as usize, main_env_ptr);
             })
-            .collect();
+        });
 
         assert_eq!(main_env.name(), initial_name);
         assert_eq!(main_env.env_ptr() as usize, main_env_ptr);
 
-        let res: Vec<std::thread::Result<_>> =
-            children.into_iter().map(|child| child.join()).collect();
+        let res = children.into_iter().map(|child| child.join());
         assert!(res.into_iter().all(|r| std::result::Result::is_ok(&r)));
     }
 }

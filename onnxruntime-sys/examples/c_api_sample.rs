@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use std::os::raw::c_char;
 #[cfg(not(target_family = "windows"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_family = "windows")]
@@ -67,11 +68,11 @@ fn main() {
         .chain(std::iter::once(0)) // Make sure we have a null terminated string
         .collect();
     #[cfg(not(target_family = "windows"))]
-    let model_path: Vec<std::os::raw::c_char> = model_path
+    let model_path: Vec<c_char> = model_path
         .as_bytes()
         .iter()
         .chain(std::iter::once(&b'\0')) // Make sure we have a null terminated string
-        .map(|b| *b as std::os::raw::c_char)
+        .map(|b| *b as c_char)
         .collect();
 
     let mut session_ptr: *mut OrtSession = std::ptr::null_mut();
@@ -117,7 +118,7 @@ fn main() {
     // iterate over all input nodes
     for i in 0..num_input_nodes {
         // print input node names
-        let mut input_name: *mut i8 = std::ptr::null_mut();
+        let mut input_name: *mut c_char = std::ptr::null_mut();
         let status = unsafe {
             g_ort.as_ref().unwrap().SessionGetInputName.unwrap()(
                 session_ptr,
@@ -278,28 +279,27 @@ fn main() {
 
     // score model & input tensor, get back output tensor
 
-    let input_node_names_cstring: Vec<std::ffi::CString> = input_node_names
+    let input_node_names_cstring = input_node_names
         .into_iter()
-        .map(|n| std::ffi::CString::new(n).unwrap())
-        .collect();
-    let input_node_names_ptr: Vec<*const i8> = input_node_names_cstring
+        .map(|n| std::ffi::CString::new(n).unwrap());
+    let input_node_names_ptr: Vec<*const c_char> = input_node_names_cstring
         .into_iter()
-        .map(|n| n.into_raw() as *const i8)
+        .map(|n| n.into_raw() as *const c_char)
         .collect();
-    let input_node_names_ptr_ptr: *const *const i8 = input_node_names_ptr.as_ptr();
+    let input_node_names_ptr_ptr: *const *const c_char = input_node_names_ptr.as_ptr();
 
     let output_node_names_cstring: Vec<std::ffi::CString> = output_node_names
-        .into_iter()
-        .map(|n| std::ffi::CString::new(n.clone()).unwrap())
-        .collect();
-    let output_node_names_ptr: Vec<*const i8> = output_node_names_cstring
         .iter()
-        .map(|n| n.as_ptr() as *const i8)
+        .map(|n| std::ffi::CString::new(*n).unwrap())
         .collect();
-    let output_node_names_ptr_ptr: *const *const i8 = output_node_names_ptr.as_ptr();
+    let output_node_names_ptr: Vec<*const c_char> = output_node_names_cstring
+        .iter()
+        .map(|n| n.as_ptr() as *const c_char)
+        .collect();
+    let output_node_names_ptr_ptr: *const *const c_char = output_node_names_ptr.as_ptr();
 
     let _input_node_names_cstring =
-        unsafe { std::ffi::CString::from_raw(input_node_names_ptr[0] as *mut i8) };
+        unsafe { std::ffi::CString::from_raw(input_node_names_ptr[0] as *mut c_char) };
     let run_options_ptr: *const OrtRunOptions = std::ptr::null();
     let mut output_tensor_ptr: *mut OrtValue = std::ptr::null_mut();
     let output_tensor_ptr_ptr: *mut *mut OrtValue = &mut output_tensor_ptr;
@@ -341,9 +341,13 @@ fn main() {
     // NOTE: The C ONNX Runtime allocated the array, we shouldn't drop the vec
     //       but let C de-allocate instead.
     let floatarr_vec: Vec<f32> = unsafe { Vec::from_raw_parts(floatarr, 5, 5) };
-    for i in 0..5 {
-        println!("Score for class [{}] =  {}", i, floatarr_vec[i]);
-    }
+    floatarr_vec
+        .iter()
+        .enumerate()
+        .take(5)
+        .for_each(|(i, floatarr)| {
+            println!("Score for class [{}] =  {}", i, floatarr);
+        });
     std::mem::forget(floatarr_vec);
 
     // Results should be as below...
@@ -363,7 +367,7 @@ fn main() {
 }
 
 fn CheckStatus(g_ort: *const OrtApi, status: *const OrtStatus) -> Result<(), String> {
-    if status != std::ptr::null() {
+    if status.is_null() {
         let raw = unsafe { g_ort.as_ref().unwrap().GetErrorMessage.unwrap()(status) };
         Err(char_p_to_str(raw).unwrap().to_string())
     } else {
@@ -371,7 +375,7 @@ fn CheckStatus(g_ort: *const OrtApi, status: *const OrtStatus) -> Result<(), Str
     }
 }
 
-fn char_p_to_str<'a>(raw: *const i8) -> Result<&'a str, std::str::Utf8Error> {
-    let c_str = unsafe { std::ffi::CStr::from_ptr(raw as *mut i8) };
+fn char_p_to_str<'a>(raw: *const c_char) -> Result<&'a str, std::str::Utf8Error> {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(raw as *mut c_char) };
     c_str.to_str()
 }

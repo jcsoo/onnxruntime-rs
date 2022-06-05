@@ -3,7 +3,7 @@
 use std::{ffi, fmt::Debug, ops::Deref};
 
 use ndarray::Array;
-use tracing::{debug, error};
+use tracing::{error, trace};
 
 use onnxruntime_sys as sys;
 
@@ -23,12 +23,13 @@ use crate::{
 /// **NOTE**: The type is not meant to be used directly, use an [`ndarray::Array`](https://docs.rs/ndarray/latest/ndarray/type.Array.html)
 /// instead.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OrtTensor<'t, T, D>
 where
     T: TypeToTensorElementDataType + Debug + Clone,
     D: ndarray::Dimension,
 {
-    pub(crate) c_ptr: *mut sys::OrtValue,
+    pub(crate) ptr: *mut sys::OrtValue,
     array: Array<T, D>,
     memory_info: &'t MemoryInfo,
 }
@@ -38,6 +39,7 @@ where
     T: TypeToTensorElementDataType + Debug + Clone,
     D: ndarray::Dimension,
 {
+    #[tracing::instrument]
     pub(crate) fn from_array<'m>(
         memory_info: &'m MemoryInfo,
         allocator_ptr: *mut sys::OrtAllocator,
@@ -46,6 +48,8 @@ where
     where
         'm: 't, // 'm outlives 't
     {
+        trace!("Creating OrtTensor.");
+
         // where onnxruntime will write the tensor data to
         let mut tensor_ptr: *mut sys::OrtValue = std::ptr::null_mut();
         let tensor_ptr_ptr: *mut *mut sys::OrtValue = &mut tensor_ptr;
@@ -139,7 +143,7 @@ where
         assert_not_null_pointer(tensor_ptr, "Tensor")?;
 
         Ok(OrtTensor {
-            c_ptr: tensor_ptr,
+            ptr: tensor_ptr,
             array,
             memory_info,
         })
@@ -165,15 +169,14 @@ where
 {
     #[tracing::instrument]
     fn drop(&mut self) {
-        // We need to let the C part free
-        debug!("Dropping Tensor.");
-        if self.c_ptr.is_null() {
-            error!("Null pointer, not calling free.");
+        if self.ptr.is_null() {
+            error!("OrtTensor pointer is null, not dropping.");
         } else {
-            unsafe { g_ort().ReleaseValue.unwrap()(self.c_ptr) }
+            trace!("Dropping OrtTensor.");
+            unsafe { g_ort().ReleaseValue.unwrap()(self.ptr) };
         }
 
-        self.c_ptr = std::ptr::null_mut();
+        self.ptr = std::ptr::null_mut();
     }
 }
 
@@ -195,14 +198,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AllocatorType, MemType};
+    use crate::{AllocatorType, DeviceName, MemType};
     use ndarray::{arr0, arr1, arr2, arr3};
     use std::ptr;
-    use test_env_log::test;
+    use test_log::test;
 
-    #[test]
+    #[test_log::test]
     fn orttensor_from_array_0d_i32() {
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
+        let memory_info =
+            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default).unwrap();
         let array = arr0::<i32>(123);
         let tensor = OrtTensor::from_array(&memory_info, ptr::null_mut(), array).unwrap();
         let expected_shape: &[usize] = &[];
@@ -211,7 +215,8 @@ mod tests {
 
     #[test]
     fn orttensor_from_array_1d_i32() {
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
+        let memory_info =
+            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default).unwrap();
         let array = arr1(&[1_i32, 2, 3, 4, 5, 6]);
         let tensor = OrtTensor::from_array(&memory_info, ptr::null_mut(), array).unwrap();
         let expected_shape: &[usize] = &[6];
@@ -220,7 +225,8 @@ mod tests {
 
     #[test]
     fn orttensor_from_array_2d_i32() {
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
+        let memory_info =
+            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default).unwrap();
         let array = arr2(&[[1_i32, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]]);
         let tensor = OrtTensor::from_array(&memory_info, ptr::null_mut(), array).unwrap();
         assert_eq!(tensor.shape(), &[2, 6]);
@@ -228,7 +234,8 @@ mod tests {
 
     #[test]
     fn orttensor_from_array_3d_i32() {
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
+        let memory_info =
+            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default).unwrap();
         let array = arr3(&[
             [[1_i32, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]],
             [[13, 14, 15, 16, 17, 18], [19, 20, 21, 22, 23, 24]],
@@ -240,7 +247,8 @@ mod tests {
 
     #[test]
     fn orttensor_from_array_1d_string() {
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
+        let memory_info =
+            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default).unwrap();
         let array = arr1(&[
             String::from("foo"),
             String::from("bar"),
@@ -252,7 +260,8 @@ mod tests {
 
     #[test]
     fn orttensor_from_array_3d_str() {
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
+        let memory_info =
+            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default).unwrap();
         let array = arr3(&[
             [["1", "2", "3"], ["4", "5", "6"]],
             [["7", "8", "9"], ["10", "11", "12"]],

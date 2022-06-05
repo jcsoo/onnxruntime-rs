@@ -1,6 +1,6 @@
 [package]
 authors = ["Nicolas Bigaouette <nbigaouette@elementai.com>"]
-edition = "2018"
+edition = "2021"
 name = "onnxruntime-sys"
 version = "0.0.14"
 
@@ -17,18 +17,14 @@ keywords = ["neuralnetworks", "onnx", "bindings"]
 [dependencies]
 
 [build-dependencies]
-bindgen = { version = "0.59", optional = true }
-ureq = "2.1"
-
-# Used on Windows
-zip = "0.5"
-
-# Used on unix
-flate2 = "1.0"
-tar = "0.4"
+bindgen = { version = "0.59.2", optional = true }
+ureq = "2.4.0"
+flate2 = "1.0.23"
+tar = "0.4.38"
 
 [features]
-default = []
+default = ["cuda", "generate-bindings"]
+cuda = []
 
 # Disable build script, used to prevent issues with docs.rs
 disable-sys-build-script = []

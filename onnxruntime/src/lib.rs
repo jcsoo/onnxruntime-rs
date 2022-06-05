@@ -115,11 +115,10 @@ to download.
 //! See the [`sample.rs`](https://github.com/nbigaouette/onnxruntime-rs/blob/master/onnxruntime/examples/sample.rs)
 //! example for more details.
 
-use std::sync::{atomic::AtomicPtr, Arc, Mutex};
-
 use lazy_static::lazy_static;
-
 use onnxruntime_sys as sys;
+use std::os::raw::c_char;
+use std::sync::{atomic::AtomicPtr, Arc, Mutex};
 
 // Make functions `extern "stdcall"` for Windows 32bit.
 // This behaviors like `extern "system"`.
@@ -144,16 +143,22 @@ macro_rules! extern_system_fn {
 pub mod download;
 pub mod environment;
 pub mod error;
-mod memory;
+pub mod io_binding;
+pub mod memory;
 pub mod session;
 pub mod tensor;
 
 // Re-export
+use crate::error::{assert_not_null_pointer, status_to_result};
 pub use error::{OrtApiError, OrtError, Result};
-use sys::OnnxEnumInt;
+pub use memory::MemoryInfo;
 
 // Re-export ndarray as it's part of the public API anyway
+use crate::tensor::{OrtOwnedTensor, OrtTensor};
 pub use ndarray;
+use ndarray::Array;
+use std::ffi::CString;
+use std::fmt::Debug;
 
 lazy_static! {
     // static ref G_ORT: Arc<Mutex<AtomicPtr<sys::OrtApi>>> =
@@ -182,8 +187,8 @@ fn g_ort() -> sys::OrtApi {
     unsafe { *api_ptr_mut }
 }
 
-fn char_p_to_string(raw: *const i8) -> Result<String> {
-    let c_string = unsafe { std::ffi::CStr::from_ptr(raw as *mut i8).to_owned() };
+fn char_p_to_string(raw: *const c_char) -> Result<String> {
+    let c_string = unsafe { std::ffi::CStr::from_ptr(raw as *mut c_char).to_owned() };
 
     match c_string.into_string() {
         Ok(string) => Ok(string),
@@ -192,11 +197,39 @@ fn char_p_to_string(raw: *const i8) -> Result<String> {
     .map_err(OrtError::StringConversion)
 }
 
+/// Get the names of all available providers
+pub fn get_available_providers() -> Result<Vec<String>> {
+    let mut out_ptr: *mut *mut c_char = vec![std::ptr::null_mut()].as_mut_ptr();
+    let mut provider_length = 0;
+
+    let status =
+        unsafe { g_ort().GetAvailableProviders.unwrap()(&mut out_ptr, &mut provider_length) };
+    status_to_result(status).map_err(OrtError::GetAvailableProviders)?;
+    assert_not_null_pointer(out_ptr, "GetAvailableProviders")?;
+
+    let available_providers = unsafe {
+        std::slice::from_raw_parts(out_ptr, provider_length as usize)
+            .iter()
+            .map(|v| {
+                std::ffi::CStr::from_ptr(*v as *const c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let status = unsafe { g_ort().ReleaseAvailableProviders.unwrap()(out_ptr, provider_length) };
+    status_to_result(status).map_err(OrtError::ReleaseAvailableProviders)?;
+
+    Ok(available_providers)
+}
+
 mod onnxruntime {
     //! Module containing a custom logger, used to catch the runtime's own logging and send it
     //! to Rust's tracing logging instead.
 
     use std::ffi::CStr;
+    use std::os::raw::c_char;
     use tracing::{debug, error, info, span, trace, warn, Level};
 
     use onnxruntime_sys as sys;
@@ -235,10 +268,10 @@ mod onnxruntime {
         pub(crate) fn custom_logger(
             _params: *mut std::ffi::c_void,
             severity: sys::OrtLoggingLevel,
-            category: *const i8,
-            logid: *const i8,
-            code_location: *const i8,
-            message: *const i8,
+            category: *const c_char,
+            logid: *const c_char,
+            code_location: *const c_char,
+            message: *const c_char,
         ) {
             let log_level = match severity {
                 sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE => Level::TRACE,
@@ -291,15 +324,15 @@ mod onnxruntime {
 #[cfg_attr(windows, repr(i32))]
 pub enum LoggingLevel {
     /// Verbose log level
-    Verbose = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE as OnnxEnumInt,
+    Verbose = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE as u32,
     /// Info log level
-    Info = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO as OnnxEnumInt,
+    Info = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO as u32,
     /// Warning log level
-    Warning = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING as OnnxEnumInt,
+    Warning = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING as u32,
     /// Error log level
-    Error = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR as OnnxEnumInt,
+    Error = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR as u32,
     /// Fatal log level
-    Fatal = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_FATAL as OnnxEnumInt,
+    Fatal = sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_FATAL as u32,
 }
 
 impl From<LoggingLevel> for sys::OrtLoggingLevel {
@@ -323,23 +356,52 @@ impl From<LoggingLevel> for sys::OrtLoggingLevel {
 #[cfg_attr(windows, repr(i32))]
 pub enum GraphOptimizationLevel {
     /// Disable optimization
-    DisableAll = sys::GraphOptimizationLevel::ORT_DISABLE_ALL as OnnxEnumInt,
+    DisableAll = sys::GraphOptimizationLevel::ORT_DISABLE_ALL as u32,
     /// Basic optimization
-    Basic = sys::GraphOptimizationLevel::ORT_ENABLE_BASIC as OnnxEnumInt,
+    Basic = sys::GraphOptimizationLevel::ORT_ENABLE_BASIC as u32,
     /// Extended optimization
-    Extended = sys::GraphOptimizationLevel::ORT_ENABLE_EXTENDED as OnnxEnumInt,
+    Extended = sys::GraphOptimizationLevel::ORT_ENABLE_EXTENDED as u32,
     /// Add optimization
-    All = sys::GraphOptimizationLevel::ORT_ENABLE_ALL as OnnxEnumInt,
+    All = sys::GraphOptimizationLevel::ORT_ENABLE_ALL as u32,
 }
 
 impl From<GraphOptimizationLevel> for sys::GraphOptimizationLevel {
     fn from(val: GraphOptimizationLevel) -> Self {
-        use GraphOptimizationLevel::*;
         match val {
-            DisableAll => sys::GraphOptimizationLevel::ORT_DISABLE_ALL,
-            Basic => sys::GraphOptimizationLevel::ORT_ENABLE_BASIC,
-            Extended => sys::GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
-            All => sys::GraphOptimizationLevel::ORT_ENABLE_ALL,
+            GraphOptimizationLevel::DisableAll => sys::GraphOptimizationLevel::ORT_DISABLE_ALL,
+            GraphOptimizationLevel::Basic => sys::GraphOptimizationLevel::ORT_ENABLE_BASIC,
+            GraphOptimizationLevel::Extended => sys::GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+            GraphOptimizationLevel::All => sys::GraphOptimizationLevel::ORT_ENABLE_ALL,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+/// DeviceName for MemoryInfo location
+pub enum DeviceName {
+    /// Cpu
+    Cpu,
+    /// Cuda
+    Cuda,
+    /// CudaPinned
+    CudaPinned,
+    /// Dml
+    Dml,
+    /// OpenVinoCpu
+    OpenVinoCpu,
+    /// OpenVinoGpu
+    OpenVinoGpu,
+}
+
+impl From<DeviceName> for CString {
+    fn from(val: DeviceName) -> Self {
+        match val {
+            DeviceName::Cpu => CString::new("Cpu").unwrap(),
+            DeviceName::Cuda => CString::new("Cuda").unwrap(),
+            DeviceName::CudaPinned => CString::new("CudaPinned").unwrap(),
+            DeviceName::Dml => CString::new("DML").unwrap(),
+            DeviceName::OpenVinoCpu => CString::new("OpenVINO_CPU").unwrap(),
+            DeviceName::OpenVinoGpu => CString::new("OpenVINO_GPU").unwrap(),
         }
     }
 }
@@ -347,42 +409,42 @@ impl From<GraphOptimizationLevel> for sys::GraphOptimizationLevel {
 // FIXME: Use https://docs.rs/bindgen/0.54.1/bindgen/struct.Builder.html#method.rustified_enum
 // FIXME: Add tests to cover the commented out types
 /// Enum mapping ONNX Runtime's supported tensor types
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(not(windows), repr(u32))]
 #[cfg_attr(windows, repr(i32))]
 pub enum TensorElementDataType {
     /// 32-bit floating point, equivalent to Rust's `f32`
-    Float = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT as OnnxEnumInt,
+    Float = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT as u32,
     /// Unsigned 8-bit int, equivalent to Rust's `u8`
-    Uint8 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 as OnnxEnumInt,
+    Uint8 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 as u32,
     /// Signed 8-bit int, equivalent to Rust's `i8`
-    Int8 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 as OnnxEnumInt,
+    Int8 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 as u32,
     /// Unsigned 16-bit int, equivalent to Rust's `u16`
-    Uint16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 as OnnxEnumInt,
+    Uint16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 as u32,
     /// Signed 16-bit int, equivalent to Rust's `i16`
-    Int16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 as OnnxEnumInt,
+    Int16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 as u32,
     /// Signed 32-bit int, equivalent to Rust's `i32`
-    Int32 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 as OnnxEnumInt,
+    Int32 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 as u32,
     /// Signed 64-bit int, equivalent to Rust's `i64`
-    Int64 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 as OnnxEnumInt,
+    Int64 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 as u32,
     /// String, equivalent to Rust's `String`
-    String = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING as OnnxEnumInt,
+    String = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING as u32,
     // /// Boolean, equivalent to Rust's `bool`
-    // Bool = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL as OnnxEnumInt,
+    // Bool = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL as u32,
     // /// 16-bit floating point, equivalent to Rust's `f16`
-    // Float16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 as OnnxEnumInt,
+    // Float16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 as u32,
     /// 64-bit floating point, equivalent to Rust's `f64`
-    Double = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE as OnnxEnumInt,
+    Double = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE as u32,
     /// Unsigned 32-bit int, equivalent to Rust's `u32`
-    Uint32 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32 as OnnxEnumInt,
+    Uint32 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32 as u32,
     /// Unsigned 64-bit int, equivalent to Rust's `u64`
-    Uint64 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64 as OnnxEnumInt,
+    Uint64 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64 as u32,
     // /// Complex 64-bit floating point, equivalent to Rust's `???`
-    // Complex64 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64 as OnnxEnumInt,
+    // Complex64 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64 as u32,
     // /// Complex 128-bit floating point, equivalent to Rust's `???`
-    // Complex128 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128 as OnnxEnumInt,
+    // Complex128 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128 as u32,
     // /// Brain 16-bit floating point
-    // Bfloat16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 as OnnxEnumInt,
+    // Bfloat16 = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 as u32,
 }
 
 impl From<TensorElementDataType> for sys::ONNXTensorElementDataType {
@@ -450,14 +512,107 @@ impl_type_trait!(u16, Uint16);
 impl_type_trait!(i16, Int16);
 impl_type_trait!(i32, Int32);
 impl_type_trait!(i64, Int64);
-// impl_type_trait!(bool, Bool);
-// impl_type_trait!(f16, Float16);
 impl_type_trait!(f64, Double);
 impl_type_trait!(u32, Uint32);
 impl_type_trait!(u64, Uint64);
-// impl_type_trait!(, Complex64);
-// impl_type_trait!(, Complex128);
-// impl_type_trait!(, Bfloat16);
+
+#[derive(Debug)]
+/// TypedArray
+pub enum TypedArray<D: ndarray::Dimension> {
+    /// F32
+    F32(Array<f32, D>),
+    /// U8
+    U8(Array<u8, D>),
+    /// I8
+    I8(Array<i8, D>),
+    /// U16
+    U16(Array<u16, D>),
+    /// I16
+    I16(Array<i16, D>),
+    /// I32
+    I32(Array<i32, D>),
+    /// I64
+    I64(Array<i64, D>),
+    /// F64
+    F64(Array<f64, D>),
+    /// U32
+    U32(Array<u32, D>),
+    /// U64
+    U64(Array<u64, D>),
+}
+
+#[derive(Debug)]
+/// TypedOrtTensor
+pub enum TypedOrtTensor<'t, D: ndarray::Dimension> {
+    /// F32
+    F32(OrtTensor<'t, f32, D>),
+    /// U8
+    U8(OrtTensor<'t, u8, D>),
+    /// I8
+    I8(OrtTensor<'t, i8, D>),
+    /// U16
+    U16(OrtTensor<'t, u16, D>),
+    /// I16
+    I16(OrtTensor<'t, i16, D>),
+    /// I32
+    I32(OrtTensor<'t, i32, D>),
+    /// I64
+    I64(OrtTensor<'t, i64, D>),
+    /// F64
+    F64(OrtTensor<'t, f64, D>),
+    /// U32
+    U32(OrtTensor<'t, u32, D>),
+    /// U64
+    U64(OrtTensor<'t, u64, D>),
+}
+
+#[derive(Debug)]
+/// TypedOrtOwnedTensor
+pub enum TypedOrtOwnedTensor<'t, 'm, D>
+where
+    D: ndarray::Dimension,
+{
+    /// F32
+    F32(OrtOwnedTensor<'t, 'm, f32, D>),
+    /// U8
+    U8(OrtOwnedTensor<'t, 'm, u8, D>),
+    /// I8
+    I8(OrtOwnedTensor<'t, 'm, i8, D>),
+    /// U16
+    U16(OrtOwnedTensor<'t, 'm, u16, D>),
+    /// I16
+    I16(OrtOwnedTensor<'t, 'm, i16, D>),
+    /// I32
+    I32(OrtOwnedTensor<'t, 'm, i32, D>),
+    /// I64
+    I64(OrtOwnedTensor<'t, 'm, i64, D>),
+    /// F64
+    F64(OrtOwnedTensor<'t, 'm, f64, D>),
+    /// U32
+    U32(OrtOwnedTensor<'t, 'm, u32, D>),
+    /// U64
+    U64(OrtOwnedTensor<'t, 'm, u64, D>),
+}
+
+impl<'t, 'm, D> From<TypedOrtOwnedTensor<'t, 'm, D>> for TypedArray<D>
+where
+    D: ndarray::Dimension,
+{
+    fn from(val: TypedOrtOwnedTensor<'t, 'm, D>) -> Self {
+        match val {
+            TypedOrtOwnedTensor::F32(tensor) => TypedArray::F32(tensor.to_owned()),
+            TypedOrtOwnedTensor::U8(tensor) => TypedArray::U8(tensor.to_owned()),
+            TypedOrtOwnedTensor::I8(tensor) => TypedArray::I8(tensor.to_owned()),
+            TypedOrtOwnedTensor::U16(tensor) => TypedArray::U16(tensor.to_owned()),
+            TypedOrtOwnedTensor::I16(tensor) => TypedArray::I16(tensor.to_owned()),
+            TypedOrtOwnedTensor::I32(tensor) => TypedArray::I32(tensor.to_owned()),
+            TypedOrtOwnedTensor::I64(tensor) => TypedArray::I64(tensor.to_owned()),
+            TypedOrtOwnedTensor::F64(tensor) => TypedArray::F64(tensor.to_owned()),
+            TypedOrtOwnedTensor::U32(tensor) => TypedArray::U32(tensor.to_owned()),
+            TypedOrtOwnedTensor::U64(tensor) => TypedArray::U64(tensor.to_owned()),
+        }
+    }
+}
 
 /// Adapter for common Rust string types to Onnx strings.
 ///
@@ -496,7 +651,8 @@ impl<T: Utf8Data> TypeToTensorElementDataType for T {
 #[derive(Debug, Clone)]
 #[repr(i32)]
 pub enum AllocatorType {
-    // Invalid = sys::OrtAllocatorType::Invalid as i32,
+    /// Invalid allocator
+    Invalid = sys::OrtAllocatorType::OrtInvalidAllocator as i32,
     /// Device allocator
     Device = sys::OrtAllocatorType::OrtDeviceAllocator as i32,
     /// Arena allocator
@@ -505,11 +661,20 @@ pub enum AllocatorType {
 
 impl From<AllocatorType> for sys::OrtAllocatorType {
     fn from(val: AllocatorType) -> Self {
-        use AllocatorType::*;
         match val {
-            // Invalid => sys::OrtAllocatorType::Invalid,
-            Device => sys::OrtAllocatorType::OrtDeviceAllocator,
-            Arena => sys::OrtAllocatorType::OrtArenaAllocator,
+            AllocatorType::Invalid => sys::OrtAllocatorType::OrtInvalidAllocator,
+            AllocatorType::Device => sys::OrtAllocatorType::OrtDeviceAllocator,
+            AllocatorType::Arena => sys::OrtAllocatorType::OrtArenaAllocator,
+        }
+    }
+}
+
+impl From<sys::OrtAllocatorType> for AllocatorType {
+    fn from(val: sys::OrtAllocatorType) -> Self {
+        match val {
+            sys::OrtAllocatorType::OrtInvalidAllocator => AllocatorType::Invalid,
+            sys::OrtAllocatorType::OrtDeviceAllocator => AllocatorType::Device,
+            sys::OrtAllocatorType::OrtArenaAllocator => AllocatorType::Arena,
         }
     }
 }
@@ -520,22 +685,30 @@ impl From<AllocatorType> for sys::OrtAllocatorType {
 #[derive(Debug, Clone)]
 #[repr(i32)]
 pub enum MemType {
-    // FIXME: C API's `OrtMemType_OrtMemTypeCPU` defines it equal to `OrtMemType_OrtMemTypeCPUOutput`. How to handle this??
-    // CPUInput = sys::OrtMemType::OrtMemTypeCPUInput as i32,
-    // CPUOutput = sys::OrtMemType::OrtMemTypeCPUOutput as i32,
-    // CPU = sys::OrtMemType::OrtMemTypeCPU as i32,
-    /// Default memory type
+    /// CPUInput
+    CPUInput = sys::OrtMemType::OrtMemTypeCPUInput as i32,
+    /// CPUOutput
+    CPUOutput = sys::OrtMemType::OrtMemTypeCPUOutput as i32,
+    /// Default
     Default = sys::OrtMemType::OrtMemTypeDefault as i32,
 }
 
 impl From<MemType> for sys::OrtMemType {
     fn from(val: MemType) -> Self {
-        use MemType::*;
         match val {
-            // CPUInput => sys::OrtMemType::OrtMemTypeCPUInput,
-            // CPUOutput => sys::OrtMemType::OrtMemTypeCPUOutput,
-            // CPU => sys::OrtMemType::OrtMemTypeCPU,
-            Default => sys::OrtMemType::OrtMemTypeDefault,
+            MemType::CPUInput => sys::OrtMemType::OrtMemTypeCPUInput,
+            MemType::CPUOutput => sys::OrtMemType::OrtMemTypeCPUOutput,
+            MemType::Default => sys::OrtMemType::OrtMemTypeDefault,
+        }
+    }
+}
+
+impl From<sys::OrtMemType> for MemType {
+    fn from(val: sys::OrtMemType) -> Self {
+        match val {
+            sys::OrtMemType::OrtMemTypeCPUInput => MemType::CPUInput,
+            sys::OrtMemType::OrtMemTypeCPUOutput => MemType::CPUOutput,
+            sys::OrtMemType::OrtMemTypeDefault => MemType::Default,
         }
     }
 }
@@ -549,5 +722,11 @@ mod test {
         let s = std::ffi::CString::new("foo").unwrap();
         let ptr = s.as_c_str().as_ptr();
         assert_eq!("foo", char_p_to_string(ptr).unwrap());
+    }
+
+    #[test]
+    fn test_get_available_providers() {
+        let available_providers = get_available_providers().unwrap();
+        assert!(available_providers.contains(&"CPUExecutionProvider".to_string()));
     }
 }

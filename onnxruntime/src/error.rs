@@ -1,12 +1,10 @@
 //! Module containing error definitions.
 
-use std::{io, path::PathBuf};
-
-use thiserror::Error;
-
-use onnxruntime_sys as sys;
-
 use crate::{char_p_to_string, g_ort};
+use onnxruntime_sys as sys;
+use std::os::raw::c_char;
+use std::{io, path::PathBuf};
+use thiserror::Error;
 
 /// Type alias for the `Result`
 pub type Result<T> = std::result::Result<T, OrtError>;
@@ -19,6 +17,12 @@ pub enum OrtError {
     /// to Rust's `String`. This operation can fail.
     #[error("Failed to construct String")]
     StringConversion(OrtApiError),
+    /// Error occurred when getting available providers
+    #[error("Failed to get available providers: {0}")]
+    GetAvailableProviders(OrtApiError),
+    /// Error occurred when releasing available providers
+    #[error("Failed to release available providers: {0}")]
+    ReleaseAvailableProviders(OrtApiError),
     // FIXME: Move these to another enum (they are C API calls errors)
     /// An error occurred when creating an ONNX environment
     #[error("Failed to create environment: {0}")]
@@ -37,7 +41,10 @@ pub enum OrtError {
     InOutCount(OrtApiError),
     /// Error occurred when getting ONNX input name
     #[error("Failed to get input name: {0}")]
-    InputName(OrtApiError),
+    SessionGetInputName(OrtApiError),
+    /// Error occurred when getting ONNX output name
+    #[error("Failed to get output name: {0}")]
+    SessionGetOutputName(OrtApiError),
     /// Error occurred when getting ONNX type information
     #[error("Failed to get type info: {0}")]
     GetTypeInfo(OrtApiError),
@@ -46,16 +53,49 @@ pub enum OrtError {
     CastTypeInfoToTensorInfo(OrtApiError),
     /// Error occurred when getting tensor elements type
     #[error("Failed to get tensor element type: {0}")]
-    TensorElementType(OrtApiError),
+    GetTensorElementType(OrtApiError),
     /// Error occurred when getting ONNX dimensions count
     #[error("Failed to get dimensions count: {0}")]
     GetDimensionsCount(OrtApiError),
     /// Error occurred when getting ONNX dimensions
     #[error("Failed to get dimensions: {0}")]
     GetDimensions(OrtApiError),
+    /// Error occurred when getting memory information
+    #[error("Failed to get get memory information: {0}")]
+    OrtMemoryInfo(OrtApiError),
+    /// Error occurred when creating memory information
+    #[error("Failed to get create memory information: {0}")]
+    CreateMemoryInfo(OrtApiError),
+    /// Error occurred when geting name from memory information
+    #[error("Failed to get memory information name: {0}")]
+    MemoryInfoGetName(OrtApiError),
+    /// Error occurred when geting id from memory information
+    #[error("Failed to get memory information id: {0}")]
+    MemoryInfoGetId(OrtApiError),
+    /// Error occurred when geting name from memory information
+    #[error("Failed to get memory information type: {0}")]
+    MemoryInfoGetMemType(OrtApiError),
+    /// Error occurred when geting allocator type from memory information
+    #[error("Failed to get memory information allocator type: {0}")]
+    MemoryInfoGetType(OrtApiError),
     /// Error occurred when creating CPU memory information
-    #[error("Failed to get dimensions: {0}")]
-    CreateCpuMemoryInfo(OrtApiError),
+    #[error("Failed to get create io_binding: {0}")]
+    CreateIoBinding(OrtApiError),
+    /// Error occurred when trying to bind an input
+    #[error("Failed to bind input: {0}")]
+    BindInput(OrtApiError),
+    /// Error occurred when trying to bind an output
+    #[error("Failed to bind output to device: {0}")]
+    BindOutputToDevice(OrtApiError),
+    /// Error occurred when trying to get bound output names
+    #[error("Failed to get bound output names: {0}")]
+    GetBoundOutputNames(OrtApiError),
+    /// Error occurred when trying to get bound output values
+    #[error("Failed to get bound output values: {0}")]
+    GetBoundOutputValues(OrtApiError),
+    /// Error occurred when trying to copy bound output values to CPU
+    #[error("Failed to copy bound output values: {0}")]
+    CopyOutputsAcrossDevices(OrtApiError),
     /// Error occurred when creating ONNX tensor
     #[error("Failed to create tensor: {0}")]
     CreateTensor(OrtApiError),
@@ -208,7 +248,7 @@ impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
         if status.0.is_null() {
             Ok(())
         } else {
-            let raw: *const i8 = unsafe { g_ort().GetErrorMessage.unwrap()(status.0) };
+            let raw: *const c_char = unsafe { g_ort().GetErrorMessage.unwrap()(status.0) };
             match char_p_to_string(raw) {
                 Ok(msg) => Err(OrtApiError::Msg(msg)),
                 Err(err) => match err {
