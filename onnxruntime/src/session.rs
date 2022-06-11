@@ -119,6 +119,19 @@ impl<'a> SessionBuilder<'a> {
         Ok(self)
     }
 
+    /// Enable profiling for a session.
+    pub fn with_profiling(self, profile_file_prefix: &str) -> Result<SessionBuilder<'a>> {
+        let profile_file_prefix = CString::new(profile_file_prefix.to_string()).unwrap();
+
+        let status = unsafe {
+            g_ort().EnableProfiling.unwrap()(self.session_options_ptr, profile_file_prefix.as_ptr())
+        };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
+        assert_null_pointer(status, "SessionStatus")?;
+
+        Ok(self)
+    }
+
     /// Set the session to use cpu
     #[cfg(feature = "cuda")]
     pub fn with_cpu(self, use_arena: i32) -> Result<SessionBuilder<'a>> {
