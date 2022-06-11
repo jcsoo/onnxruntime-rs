@@ -127,7 +127,16 @@ impl<'a> SessionBuilder<'a> {
             g_ort().EnableProfiling.unwrap()(self.session_options_ptr, profile_file_prefix.as_ptr())
         };
         status_to_result(status).map_err(OrtError::SessionOptions)?;
-        assert_null_pointer(status, "SessionStatus")?;
+
+        Ok(self)
+    }
+
+    /// Enable profiling for a session.
+    pub fn with_execution_mode(self, exection_mode: ExecutionMode) -> Result<SessionBuilder<'a>> {
+        let status = unsafe {
+            g_ort().SetSessionExecutionMode.unwrap()(self.session_options_ptr, exection_mode.into())
+        };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
 
         Ok(self)
     }
@@ -365,6 +374,24 @@ impl<'a> SessionBuilder<'a> {
             inputs,
             outputs,
         })
+    }
+}
+
+/// Execution mode
+#[derive(Debug, Clone)]
+pub enum ExecutionMode {
+    /// Sequential
+    Sequential,
+    /// Parallel
+    Parallel,
+}
+
+impl From<ExecutionMode> for sys::ExecutionMode {
+    fn from(val: ExecutionMode) -> Self {
+        match val {
+            ExecutionMode::Sequential => sys::ExecutionMode::ORT_SEQUENTIAL,
+            ExecutionMode::Parallel => sys::ExecutionMode::ORT_PARALLEL,
+        }
     }
 }
 
