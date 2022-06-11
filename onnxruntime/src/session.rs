@@ -121,7 +121,7 @@ impl<'a> SessionBuilder<'a> {
 
     /// Set the session to use cpu
     #[cfg(feature = "cuda")]
-    pub fn use_cpu(self, use_arena: i32) -> Result<SessionBuilder<'a>> {
+    pub fn with_cpu(self, use_arena: i32) -> Result<SessionBuilder<'a>> {
         unsafe {
             sys::OrtSessionOptionsAppendExecutionProvider_CPU(self.session_options_ptr, use_arena);
         }
@@ -130,61 +130,57 @@ impl<'a> SessionBuilder<'a> {
 
     /// Set the session to use cuda
     #[cfg(feature = "cuda")]
-    pub fn use_cuda(self, device_id: i32) -> Result<SessionBuilder<'a>> {
+    pub fn with_cuda(self, options: CUDAProviderOptions) -> Result<SessionBuilder<'a>> {
         unsafe {
-            sys::OrtSessionOptionsAppendExecutionProvider_CUDA(self.session_options_ptr, device_id);
+            let mut cuda_options_ptr: *mut sys::OrtCUDAProviderOptionsV2 = std::ptr::null_mut();
+            let status = g_ort().CreateCUDAProviderOptions.unwrap()(&mut cuda_options_ptr);
+            status_to_result(status).map_err(OrtError::Allocator)?;
+            assert_not_null_pointer(cuda_options_ptr, "OrtCUDAProviderOptionsV2")?;
+
+            let (keys, values) = options.get_keys_values();
+
+            let status = g_ort().UpdateCUDAProviderOptions.unwrap()(
+                cuda_options_ptr,
+                keys.iter().map(|k| k.as_ptr()).collect::<Vec<_>>().as_ptr(),
+                values
+                    .iter()
+                    .map(|v| v.as_ptr())
+                    .collect::<Vec<_>>()
+                    .as_ptr(),
+                keys.len(),
+            );
+            status_to_result(status).map_err(OrtError::Allocator)?;
+
+            let status = g_ort()
+                .SessionOptionsAppendExecutionProvider_CUDA_V2
+                .unwrap()(self.session_options_ptr, cuda_options_ptr);
+
+            status_to_result(status).map_err(OrtError::Allocator)?;
+
+            g_ort().ReleaseCUDAProviderOptions.unwrap()(cuda_options_ptr);
         }
         Ok(self)
     }
 
     /// Set the session to use cuda
     #[cfg(feature = "cuda")]
-    pub fn use_tensorrt(self, device_id: i32, fp16: bool) -> Result<SessionBuilder<'a>> {
+    pub fn with_tensorrt(self, options: TensorrtProviderOptions) -> Result<SessionBuilder<'a>> {
         unsafe {
             let mut trt_options_ptr: *mut sys::OrtTensorRTProviderOptionsV2 = std::ptr::null_mut();
             let status = g_ort().CreateTensorRTProviderOptions.unwrap()(&mut trt_options_ptr);
             status_to_result(status).map_err(OrtError::Allocator)?;
             assert_not_null_pointer(trt_options_ptr, "OrtTensorRTProviderOptionsV2")?;
 
-            let device_id_key = CString::new("device_id").unwrap();
-            let device_id_value = CString::new(device_id.to_string()).unwrap();
-
-            let trt_int8_enable_key = CString::new("trt_int8_enable").unwrap();
-            let trt_int8_enable_value = CString::new("0").unwrap();
-
-            let trt_fp16_enable_key = CString::new("trt_fp16_enable").unwrap();
-            let trt_fp16_enable_value = CString::new(if fp16 { "1" } else { "0" }).unwrap();
-
-            let trt_max_workspace_size_key = CString::new("trt_max_workspace_size").unwrap();
-            let trt_max_workspace_size_value = CString::new("4294967296").unwrap();
-
-            let trt_engine_cache_enable_key = CString::new("trt_engine_cache_enable").unwrap();
-            let trt_engine_cache_enable_value = CString::new("1").unwrap();
-
-            let trt_engine_cache_path_key = CString::new("trt_engine_cache_path").unwrap();
-            let trt_engine_cache_path_value = CString::new("./").unwrap();
-
-            let keys: Vec<*const c_char> = vec![
-                device_id_key.as_ptr(),
-                trt_fp16_enable_key.as_ptr(),
-                trt_int8_enable_key.as_ptr(),
-                trt_max_workspace_size_key.as_ptr(),
-                trt_engine_cache_enable_key.as_ptr(),
-                trt_engine_cache_path_key.as_ptr(),
-            ];
-            let values: Vec<*const c_char> = vec![
-                device_id_value.as_ptr(),
-                trt_fp16_enable_value.as_ptr(),
-                trt_int8_enable_value.as_ptr(),
-                trt_max_workspace_size_value.as_ptr(),
-                trt_engine_cache_enable_value.as_ptr(),
-                trt_engine_cache_path_value.as_ptr(),
-            ];
+            let (keys, values) = options.get_keys_values();
 
             let status = g_ort().UpdateTensorRTProviderOptions.unwrap()(
                 trt_options_ptr,
-                keys.as_ptr(),
-                values.as_ptr(),
+                keys.iter().map(|k| k.as_ptr()).collect::<Vec<_>>().as_ptr(),
+                values
+                    .iter()
+                    .map(|v| v.as_ptr())
+                    .collect::<Vec<_>>()
+                    .as_ptr(),
                 keys.len(),
             );
             status_to_result(status).map_err(OrtError::Allocator)?;
@@ -356,6 +352,384 @@ impl<'a> SessionBuilder<'a> {
             inputs,
             outputs,
         })
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+/// Configuration options for the CUDA Execution Provider.
+pub struct CUDAProviderOptions {
+    /// The device ID.
+    device_id: usize,
+    /// The size limit of the device memory arena in bytes.
+    gpu_mem_limit: usize,
+    /// The strategy for extending the device memory arena.
+    arena_extend_strategy: ArenaExtendStrategy,
+    /// The type of search done for cuDNN convolution algorithms.
+    cudnn_conv_algo_search: CuDNNConvAlgoSearch,
+    /// Whether to do copies in the default stream or use separate streams.
+    do_copy_in_default_stream: bool,
+    /// Allow ORT to allocate the maximum possible workspace as determined by CuDNN.
+    cudnn_conv_use_max_workspace: bool,
+    /// Convolution Input Padding in the CUDA EP.
+    cudnn_conv1d_pad_to_nc1d: bool,
+    /// Enable the usage of CUDA Graphs.
+    enable_cuda_graph: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Default for CUDAProviderOptions {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            gpu_mem_limit: 18446744073709551615,
+            arena_extend_strategy: ArenaExtendStrategy::NextPowerOfTwo,
+            cudnn_conv_algo_search: CuDNNConvAlgoSearch::Exhaustive,
+            do_copy_in_default_stream: true,
+            cudnn_conv_use_max_workspace: false,
+            cudnn_conv1d_pad_to_nc1d: false,
+            enable_cuda_graph: false,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CUDAProviderOptions {
+    fn get_keys_values(&self) -> (Vec<CString>, Vec<CString>) {
+        let keys = vec![
+            "device_id",
+            "gpu_mem_limit",
+            "arena_extend_strategy",
+            "cudnn_conv_algo_search",
+            "do_copy_in_default_stream",
+            "cudnn_conv_use_max_workspace",
+            "cudnn_conv1d_pad_to_nc1d",
+            "enable_cuda_graph",
+        ]
+        .into_iter()
+        .map(|k| CString::new(k).unwrap())
+        .collect::<Vec<_>>();
+
+        let values = vec![
+            self.device_id.to_string(),
+            self.gpu_mem_limit.to_string(),
+            match self.arena_extend_strategy {
+                ArenaExtendStrategy::NextPowerOfTwo => "kNextPowerOfTwo",
+                ArenaExtendStrategy::SameAsRequested => "kSameAsRequested",
+            }
+            .to_string(),
+            match self.cudnn_conv_algo_search {
+                CuDNNConvAlgoSearch::Exhaustive => "EXHAUSTIVE",
+                CuDNNConvAlgoSearch::Heuristic => "HEURISTIC",
+                CuDNNConvAlgoSearch::Default => "DEFAULT",
+            }
+            .to_string(),
+            (if self.do_copy_in_default_stream { 1 } else { 0 }).to_string(),
+            (if self.cudnn_conv_use_max_workspace {
+                1
+            } else {
+                0
+            })
+            .to_string(),
+            (if self.cudnn_conv1d_pad_to_nc1d { 1 } else { 0 }).to_string(),
+            (if self.enable_cuda_graph { 1 } else { 0 }).to_string(),
+        ]
+        .into_iter()
+        .map(|k| CString::new(k).unwrap())
+        .collect::<Vec<_>>();
+
+        (keys, values)
+    }
+
+    /// Set device_id
+    pub fn with_device_id(mut self, device_id: usize) -> Self {
+        self.device_id = device_id;
+        self
+    }
+
+    /// Set gpu_mem_limit
+    pub fn with_gpu_mem_limit(mut self, gpu_mem_limit: usize) -> Self {
+        self.gpu_mem_limit = gpu_mem_limit;
+        self
+    }
+
+    /// Set arena_extend_strategy
+    pub fn with_arena_extend_strategy(
+        mut self,
+        arena_extend_strategy: ArenaExtendStrategy,
+    ) -> Self {
+        self.arena_extend_strategy = arena_extend_strategy;
+        self
+    }
+
+    /// Set cudnn_conv_algo_search
+    pub fn with_cudnn_conv_algo_search(
+        mut self,
+        cudnn_conv_algo_search: CuDNNConvAlgoSearch,
+    ) -> Self {
+        self.cudnn_conv_algo_search = cudnn_conv_algo_search;
+        self
+    }
+
+    /// Set do_copy_in_default_stream
+    pub fn with_do_copy_in_default_stream(mut self, do_copy_in_default_stream: bool) -> Self {
+        self.do_copy_in_default_stream = do_copy_in_default_stream;
+        self
+    }
+
+    /// Set cudnn_conv_use_max_workspace
+    pub fn with_cudnn_conv_use_max_workspace(mut self, cudnn_conv_use_max_workspace: bool) -> Self {
+        self.cudnn_conv_use_max_workspace = cudnn_conv_use_max_workspace;
+        self
+    }
+
+    /// Set cudnn_conv1d_pad_to_nc1d
+    pub fn with_cudnn_conv1d_pad_to_nc1d(mut self, cudnn_conv1d_pad_to_nc1d: bool) -> Self {
+        self.cudnn_conv1d_pad_to_nc1d = cudnn_conv1d_pad_to_nc1d;
+        self
+    }
+
+    /// Set enable_cuda_graph
+    pub fn with_enable_cuda_graph(mut self, enable_cuda_graph: bool) -> Self {
+        self.enable_cuda_graph = enable_cuda_graph;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+/// The strategy for extending the device memory arena.
+pub enum ArenaExtendStrategy {
+    /// subsequent extensions extend by larger amounts (multiplied by powers of two)
+    NextPowerOfTwo = 0,
+    /// extend by the requested amount
+    SameAsRequested = 1,
+}
+
+#[derive(Debug, Clone)]
+/// The type of search done for cuDNN convolution algorithms.
+pub enum CuDNNConvAlgoSearch {
+    /// expensive exhaustive benchmarking using cudnnFindConvolutionForwardAlgorithmEx
+    Exhaustive,
+    /// lightweight heuristic based search using cudnnGetConvolutionForwardAlgorithm_v7
+    Heuristic,
+    /// default algorithm using CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+    Default,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+/// Configuration options for the TensorRT Execution Provider.
+pub struct TensorrtProviderOptions {
+    /// The device ID.
+    device_id: usize,
+    /// The maximum workspace size for TensorRT engine.
+    trt_max_workspace_size: usize,
+    /// The maximum number of iterations allowed in model partitioning for TensorRT.
+    trt_max_partition_iterations: usize,
+    /// The minimum node size in a subgraph after partitioning.
+    trt_min_subgraph_size: usize,
+    /// Enable FP16 mode in TensorRT.
+    trt_fp16_enable: bool,
+    /// Enable FP16 mode in TensorRT.
+    trt_int8_enable: bool,
+    /// Specify INT8 calibration table file for non-QDQ models in INT8 mode.
+    trt_int8_calibration_table_name: Option<String>,
+    ///  Select what calibration table is used for non-QDQ models in INT8 mode.
+    /// If 1, native TensorRT generated calibration table is used; if 0, ONNXRUNTIME tool generated calibration table is used.
+    trt_int8_use_native_calibration_table: bool,
+    /// Enable Deep Learning Accelerator (DLA).
+    trt_dla_enable: bool,
+    /// Specify DLA core to execute on.
+    trt_dla_core: usize,
+    /// Enable TensorRT engine caching.
+    trt_engine_cache_enable: bool,
+    /// Specify path for TensorRT engine and profile files.
+    trt_engine_cache_path: Option<String>,
+    /// Dumps the subgraphs that are transformed into TRT engines in onnx format to the filesystem.
+    trt_dump_subgraphs: bool,
+    /// Sequentially build TensorRT engines across provider instances in multi-GPU environment.
+    trt_force_sequential_engine_build: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Default for TensorrtProviderOptions {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            trt_max_workspace_size: 1073741824,
+            trt_max_partition_iterations: 1000,
+            trt_min_subgraph_size: 1,
+            trt_fp16_enable: false,
+            trt_int8_enable: false,
+            trt_int8_calibration_table_name: None,
+            trt_int8_use_native_calibration_table: false,
+            trt_dla_enable: false,
+            trt_dla_core: 0,
+            trt_engine_cache_enable: false,
+            trt_engine_cache_path: None,
+            trt_dump_subgraphs: false,
+            trt_force_sequential_engine_build: false,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl TensorrtProviderOptions {
+    fn get_keys_values(&self) -> (Vec<CString>, Vec<CString>) {
+        let mut keys = vec![
+            "device_id",
+            "trt_max_workspace_size",
+            "trt_max_partition_iterations",
+            "trt_min_subgraph_size",
+            "trt_fp16_enable",
+            "trt_int8_enable",
+            "trt_int8_use_native_calibration_table",
+            "trt_dla_enable",
+            "trt_dla_core",
+            "trt_engine_cache_enable",
+            "trt_dump_subgraphs",
+            "trt_force_sequential_engine_build",
+        ]
+        .into_iter()
+        .map(|k| CString::new(k).unwrap())
+        .collect::<Vec<_>>();
+
+        let mut values = vec![
+            self.device_id.to_string(),
+            self.trt_max_workspace_size.to_string(),
+            self.trt_max_partition_iterations.to_string(),
+            self.trt_min_subgraph_size.to_string(),
+            (if self.trt_fp16_enable { 1 } else { 0 }).to_string(),
+            (if self.trt_int8_enable { 1 } else { 0 }).to_string(),
+            (if self.trt_int8_use_native_calibration_table {
+                1
+            } else {
+                0
+            })
+            .to_string(),
+            (if self.trt_dla_enable { 1 } else { 0 }).to_string(),
+            self.trt_dla_core.to_string(),
+            (if self.trt_engine_cache_enable { 1 } else { 0 }).to_string(),
+            (if self.trt_dump_subgraphs { 1 } else { 0 }).to_string(),
+            (if self.trt_force_sequential_engine_build {
+                1
+            } else {
+                0
+            })
+            .to_string(),
+        ]
+        .into_iter()
+        .map(|k| CString::new(k).unwrap())
+        .collect::<Vec<_>>();
+
+        if let Some(trt_engine_cache_path) = &self.trt_engine_cache_path {
+            keys.push(CString::new("trt_engine_cache_path").unwrap());
+            values.push(CString::new(trt_engine_cache_path.clone()).unwrap());
+        };
+
+        if let Some(trt_int8_calibration_table_name) = &self.trt_int8_calibration_table_name {
+            keys.push(CString::new("trt_int8_calibration_table_name").unwrap());
+            values.push(CString::new(trt_int8_calibration_table_name.clone()).unwrap());
+        };
+
+        (keys, values)
+    }
+
+    /// Set device_id
+    pub fn with_device_id(mut self, device_id: usize) -> Self {
+        self.device_id = device_id;
+        self
+    }
+
+    /// Set trt_max_workspace_size
+    pub fn with_trt_max_workspace_size(mut self, trt_max_workspace_size: usize) -> Self {
+        self.trt_max_workspace_size = trt_max_workspace_size;
+        self
+    }
+
+    /// Set trt_max_partition_iterations
+    pub fn with_trt_max_partition_iterations(
+        mut self,
+        trt_max_partition_iterations: usize,
+    ) -> Self {
+        self.trt_max_partition_iterations = trt_max_partition_iterations;
+        self
+    }
+
+    /// Set trt_min_subgraph_size
+    pub fn with_trt_min_subgraph_size(mut self, trt_min_subgraph_size: usize) -> Self {
+        self.trt_min_subgraph_size = trt_min_subgraph_size;
+        self
+    }
+
+    /// Set trt_fp16_enable
+    pub fn with_trt_fp16_enable(mut self, trt_fp16_enable: bool) -> Self {
+        self.trt_fp16_enable = trt_fp16_enable;
+        self
+    }
+
+    /// Set trt_int8_enable
+    pub fn with_trt_int8_enable(mut self, trt_int8_enable: bool) -> Self {
+        self.trt_int8_enable = trt_int8_enable;
+        self
+    }
+
+    /// Set trt_int8_calibration_table_name
+    pub fn with_trt_int8_calibration_table_name(
+        mut self,
+        trt_int8_calibration_table_name: Option<&str>,
+    ) -> Self {
+        self.trt_int8_calibration_table_name =
+            trt_int8_calibration_table_name.map(|v| v.to_string());
+        self
+    }
+
+    /// Set trt_int8_use_native_calibration_table
+    pub fn with_trt_int8_use_native_calibration_table(
+        mut self,
+        trt_int8_use_native_calibration_table: bool,
+    ) -> Self {
+        self.trt_int8_use_native_calibration_table = trt_int8_use_native_calibration_table;
+        self
+    }
+
+    /// Set trt_dla_enable
+    pub fn with_trt_dla_enable(mut self, trt_dla_enable: bool) -> Self {
+        self.trt_dla_enable = trt_dla_enable;
+        self
+    }
+
+    /// Set trt_dla_core
+    pub fn with_trt_dla_core(mut self, trt_dla_core: usize) -> Self {
+        self.trt_dla_core = trt_dla_core;
+        self
+    }
+
+    /// Set trt_engine_cache_enable
+    pub fn with_trt_engine_cache_enable(mut self, trt_engine_cache_enable: bool) -> Self {
+        self.trt_engine_cache_enable = trt_engine_cache_enable;
+        self
+    }
+
+    /// Set trt_engine_cache_path
+    pub fn with_trt_engine_cache_path(mut self, trt_engine_cache_path: Option<&str>) -> Self {
+        self.trt_engine_cache_path = trt_engine_cache_path.map(|v| v.to_string());
+        self
+    }
+
+    /// Set trt_dump_subgraphs
+    pub fn with_trt_dump_subgraphs(mut self, trt_dump_subgraphs: bool) -> Self {
+        self.trt_dump_subgraphs = trt_dump_subgraphs;
+        self
+    }
+
+    /// Set trt_force_sequential_engine_build
+    pub fn with_trt_force_sequential_engine_build(
+        mut self,
+        trt_force_sequential_engine_build: bool,
+    ) -> Self {
+        self.trt_force_sequential_engine_build = trt_force_sequential_engine_build;
+        self
     }
 }
 

@@ -4,7 +4,7 @@ use nshare::ToNdarray3;
 
 use onnxruntime::{
     environment::Environment, ndarray::Array, AllocatorType, GraphOptimizationLevel, LoggingLevel,
-    MemType, MemoryInfo, TypedArray, TypedOrtOwnedTensor,
+    MemType, MemoryInfo, TensorrtProviderOptions, TypedArray, TypedOrtOwnedTensor,
 };
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
@@ -14,6 +14,7 @@ type Error = Box<dyn std::error::Error>;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::iter;
 use std::time::Instant;
 
 static N: usize = 1000;
@@ -55,7 +56,12 @@ fn run() -> Result<(), Error> {
 
     let session = environment
         .new_session_builder()?
-        .use_tensorrt(0, true)?
+        .with_tensorrt(
+            TensorrtProviderOptions::default()
+                .with_trt_fp16_enable(true)
+                .with_trt_engine_cache_enable(true)
+                .with_trt_engine_cache_path(Some("./")),
+        )?
         .with_optimization_level(GraphOptimizationLevel::All)?
         .with_number_threads(8)?
         .with_model_from_file(format!("yolov4_b{}_c3_h320_w320.onnx", BATCH_SIZE))?;
@@ -65,9 +71,14 @@ fn run() -> Result<(), Error> {
         .into_ndarray3()
         .mapv(|v| v as f32);
 
-    let batch = stack![Axis(0), img, img, img, img, img, img]
-        .into_shape(vec![BATCH_SIZE, 3, 320, 320])
-        .unwrap();
+    let batch = stack(
+        Axis(0),
+        &iter::repeat(img.view())
+            .take(BATCH_SIZE)
+            .collect::<Vec<_>>(),
+    )?
+    .into_shape(vec![BATCH_SIZE, 3, 320, 320])
+    .unwrap();
 
     let max_output_boxes_per_class = Array::from_elem(1, 200).into_shape(vec![1]).unwrap();
     let iou_threshold = Array::from_elem(1, 0.5).into_shape(vec![1]).unwrap();
@@ -135,7 +146,8 @@ fn run() -> Result<(), Error> {
             let box_index = selected_index[2] as usize;
 
             println!(
-                "{} {} {} {} {} {}",
+                "{} {} {} {} {} {} {}",
+                batch_index,
                 names.get(class_index).unwrap(),
                 confidences[[batch_index, box_index, class_index]],
                 boxes[[batch_index, box_index, 0]],

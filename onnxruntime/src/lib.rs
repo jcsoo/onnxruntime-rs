@@ -152,6 +152,8 @@ pub mod tensor;
 use crate::error::{assert_not_null_pointer, status_to_result};
 pub use error::{OrtApiError, OrtError, Result};
 pub use memory::MemoryInfo;
+#[cfg(feature = "cuda")]
+pub use session::{CUDAProviderOptions, TensorrtProviderOptions};
 
 // Re-export ndarray as it's part of the public API anyway
 use crate::tensor::{OrtOwnedTensor, OrtTensor};

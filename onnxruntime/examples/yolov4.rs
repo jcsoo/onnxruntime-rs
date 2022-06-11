@@ -3,8 +3,8 @@
 use ndarray::{stack, Axis};
 use nshare::ToNdarray3;
 use onnxruntime::{
-    environment::Environment, ndarray::Array, GraphOptimizationLevel, LoggingLevel, TypedArray,
-    TypedOrtOwnedTensor,
+    environment::Environment, ndarray::Array, GraphOptimizationLevel, LoggingLevel,
+    TensorrtProviderOptions, TypedArray, TypedOrtOwnedTensor,
 };
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::iter;
 use std::time::Instant;
 
 static N: usize = 1000;
@@ -56,19 +57,29 @@ fn run() -> Result<(), Error> {
 
     let session = environment
         .new_session_builder()?
-        .use_tensorrt(0, true)?
+        .with_tensorrt(
+            TensorrtProviderOptions::default()
+                .with_trt_fp16_enable(true)
+                .with_trt_engine_cache_enable(true)
+                .with_trt_engine_cache_path(Some("./")),
+        )?
         .with_optimization_level(GraphOptimizationLevel::All)?
         .with_number_threads(8)?
         .with_model_from_file(format!("yolov4_b{}_c3_h320_w320.onnx", BATCH_SIZE))?;
 
-    let img_raw = image::io::Reader::open("out.png")?.decode()?.to_rgb8();
+    let img_raw = image::io::Reader::open("person.jpg")?.decode()?.to_rgb8();
     let img = image::imageops::resize(&img_raw, 320, 320, image::imageops::Nearest)
         .into_ndarray3()
         .mapv(|v| v as f32);
 
-    let batch = stack![Axis(0), img, img, img, img, img, img]
-        .into_shape(vec![BATCH_SIZE, 3, 320, 320])
-        .unwrap();
+    let batch = stack(
+        Axis(0),
+        &iter::repeat(img.view())
+            .take(BATCH_SIZE)
+            .collect::<Vec<_>>(),
+    )?
+    .into_shape(vec![BATCH_SIZE, 3, 320, 320])
+    .unwrap();
 
     let max_output_boxes_per_class = Array::from_elem(1, 50_i64).into_shape(vec![1])?;
     let iou_threshold = Array::from_elem(1, 0.5_f32).into_shape(vec![1])?;
