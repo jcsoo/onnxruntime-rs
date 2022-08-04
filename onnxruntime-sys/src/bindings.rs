@@ -2678,6 +2678,17 @@ pub enum OrtErrorCode {
     ORT_INVALID_GRAPH = 10,
     ORT_EP_FAIL = 11,
 }
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum OrtOpAttrType {
+    ORT_OP_ATTR_UNDEFINED = 0,
+    ORT_OP_ATTR_INT = 1,
+    ORT_OP_ATTR_INTS = 2,
+    ORT_OP_ATTR_FLOAT = 3,
+    ORT_OP_ATTR_FLOATS = 4,
+    ORT_OP_ATTR_STRING = 5,
+    ORT_OP_ATTR_STRINGS = 6,
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct OrtEnv {
@@ -2776,6 +2787,16 @@ pub struct OrtTensorRTProviderOptionsV2 {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct OrtCUDAProviderOptionsV2 {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtOp {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct OrtOpAttr {
     _unused: [u8; 0],
 }
 pub type OrtStatusPtr = *mut OrtStatus;
@@ -3595,6 +3616,8 @@ pub struct OrtOpenVINOProviderOptions {
     pub context: *mut ::std::os::raw::c_void,
     #[doc = "< 0 = disabled, nonzero = enabled"]
     pub enable_opencl_throttling: ::std::os::raw::c_uchar,
+    #[doc = "< 0 = disabled, nonzero = enabled"]
+    pub enable_dynamic_shapes: ::std::os::raw::c_uchar,
 }
 #[test]
 fn bindgen_test_layout_OrtOpenVINOProviderOptions() {
@@ -3707,6 +3730,19 @@ fn bindgen_test_layout_OrtOpenVINOProviderOptions() {
             stringify!(OrtOpenVINOProviderOptions),
             "::",
             stringify!(enable_opencl_throttling)
+        )
+    );
+    assert_eq!(
+        unsafe {
+            &(*(::std::ptr::null::<OrtOpenVINOProviderOptions>())).enable_dynamic_shapes as *const _
+                as usize
+        },
+        57usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtOpenVINOProviderOptions),
+            "::",
+            stringify!(enable_dynamic_shapes)
         )
     );
 }
@@ -5040,19 +5076,65 @@ pub struct OrtApi {
             initializers_num: usize,
         ) -> OrtStatusPtr,
     >,
-    pub CopyOutputsAcrossDevices: ::std::option::Option<
+    pub CreateOpAttr: ::std::option::Option<
         unsafe extern "C" fn(
-            binding_ptr: *mut OrtIoBinding,
-            output_names_len: usize,
-            output: *mut *mut OrtValue,
+            name: *const ::std::os::raw::c_char,
+            data: *const ::std::os::raw::c_void,
+            len: ::std::os::raw::c_int,
+            type_: OrtOpAttrType,
+            op_attr: *mut *mut OrtOpAttr,
         ) -> OrtStatusPtr,
     >,
+    pub ReleaseOpAttr: ::std::option::Option<unsafe extern "C" fn(input: *mut OrtOpAttr)>,
+    pub CreateOp: ::std::option::Option<
+        unsafe extern "C" fn(
+            info: *const OrtKernelInfo,
+            op_name: *const ::std::os::raw::c_char,
+            domain: *const ::std::os::raw::c_char,
+            version: ::std::os::raw::c_int,
+            type_constraint_names: *mut *const ::std::os::raw::c_char,
+            type_constraint_values: *const ONNXTensorElementDataType,
+            type_constraint_count: ::std::os::raw::c_int,
+            attr_values: *const *const OrtOpAttr,
+            attr_count: ::std::os::raw::c_int,
+            input_count: ::std::os::raw::c_int,
+            output_count: ::std::os::raw::c_int,
+            ort_op: *mut *mut OrtOp,
+        ) -> OrtStatusPtr,
+    >,
+    pub InvokeOp: ::std::option::Option<
+        unsafe extern "C" fn(
+            context: *const OrtKernelContext,
+            ort_op: *const OrtOp,
+            input_values: *const *const OrtValue,
+            input_count: ::std::os::raw::c_int,
+            output_values: *const *mut OrtValue,
+            output_count: ::std::os::raw::c_int,
+        ) -> OrtStatusPtr,
+    >,
+    pub ReleaseOp: ::std::option::Option<unsafe extern "C" fn(input: *mut OrtOp)>,
+    pub SessionOptionsAppendExecutionProvider: ::std::option::Option<
+        unsafe extern "C" fn(
+            options: *mut OrtSessionOptions,
+            provider_name: *const ::std::os::raw::c_char,
+            provider_options_keys: *const *const ::std::os::raw::c_char,
+            provider_options_values: *const *const ::std::os::raw::c_char,
+            num_keys: usize,
+        ) -> OrtStatusPtr,
+    >,
+    pub CopyKernelInfo: ::std::option::Option<
+        unsafe extern "C" fn(
+            info: *const OrtKernelInfo,
+            info_copy: *mut *mut OrtKernelInfo,
+        ) -> OrtStatusPtr,
+    >,
+    pub ReleaseKernelInfo: ::std::option::Option<unsafe extern "C" fn(input: *mut OrtKernelInfo)>,
 }
 #[test]
 fn bindgen_test_layout_OrtApi() {
     assert_eq!(
         ::std::mem::size_of::<OrtApi>(),
-        1696usize,
+        1752usize,
         concat!("Size of: ", stringify!(OrtApi))
     );
     assert_eq!(
@@ -7346,13 +7428,86 @@ fn bindgen_test_layout_OrtApi() {
         )
     );
     assert_eq!(
-        unsafe { &(*(::std::ptr::null::<OrtApi>())).CopyOutputsAcrossDevices as *const _ as usize },
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).CreateOpAttr as *const _ as usize },
         1688usize,
         concat!(
             "Offset of field: ",
             stringify!(OrtApi),
             "::",
-            stringify!(CopyOutputsAcrossDevices)
+            stringify!(CreateOpAttr)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).ReleaseOpAttr as *const _ as usize },
+        1696usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(ReleaseOpAttr)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).CreateOp as *const _ as usize },
+        1704usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(CreateOp)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).InvokeOp as *const _ as usize },
+        1712usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(InvokeOp)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).ReleaseOp as *const _ as usize },
+        1720usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(ReleaseOp)
+        )
+    );
+    assert_eq!(
+        unsafe {
+            &(*(::std::ptr::null::<OrtApi>())).SessionOptionsAppendExecutionProvider as *const _
+                as usize
+        },
+        1728usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(SessionOptionsAppendExecutionProvider)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).CopyKernelInfo as *const _ as usize },
+        1736usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(CopyKernelInfo)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<OrtApi>())).ReleaseKernelInfo as *const _ as usize },
+        1744usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(OrtApi),
+            "::",
+            stringify!(ReleaseKernelInfo)
         )
     );
 }

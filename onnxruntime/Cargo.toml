@@ -41,6 +41,7 @@ cuda = ["onnxruntime-sys/cuda"]
 # Disable build script; used for https://docs.rs
 disable-sys-build-script = ["onnxruntime-sys/disable-sys-build-script"]
 generate-bindings = ["onnxruntime-sys/generate-bindings"]
+copy-outputs-across-devices = []
 
 [package.metadata.docs.rs]
 features = ["disable-sys-build-script", "model-fetching"]

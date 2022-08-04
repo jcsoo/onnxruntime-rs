@@ -1,16 +1,19 @@
 //! Module containing IoBinding.
 
+#[cfg(feature = "copy-outputs-across-devices")]
+use crate::TypedOrtOwnedTensor;
 use crate::{
     error::{assert_not_null_pointer, status_to_result, OrtError, Result},
     g_ort,
     memory::MemoryInfo,
     session::Session,
-    tensor::ort_owned_tensor::OrtOwnedTensorExtractor,
-    OrtTensor, TypedArray, TypedOrtOwnedTensor, TypedOrtTensor,
+    OrtTensor, TypedArray, TypedOrtTensor,
 };
 use onnxruntime_sys as sys;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+#[cfg(feature = "copy-outputs-across-devices")]
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::fmt::Debug;
 use tracing::{error, trace};
 
@@ -165,6 +168,7 @@ where
     }
 
     /// Bind an ::OrtIoBinding output to a device
+    #[cfg(feature = "copy-outputs-across-devices")]
     #[tracing::instrument]
     pub fn copy_outputs_to_cpu(
         &self,
