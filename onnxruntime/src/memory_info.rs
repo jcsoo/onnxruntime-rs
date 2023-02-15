@@ -14,18 +14,21 @@ use tracing::{error, trace};
 /// MemoryInfo
 pub struct MemoryInfo {
     pub(crate) ptr: *mut sys::OrtMemoryInfo,
-    id: i32,
+    device_id: i32,
     name: DeviceName,
     allocator_type: AllocatorType,
     mem_type: MemType,
 }
+
+unsafe impl Send for MemoryInfo {}
+unsafe impl Sync for MemoryInfo {}
 
 impl MemoryInfo {
     #[tracing::instrument]
     /// Create new MemoryInfo
     pub fn new(
         name: DeviceName,
-        id: i32,
+        device_id: i32,
         allocator_type: AllocatorType,
         mem_type: MemType,
     ) -> Result<Self> {
@@ -37,7 +40,7 @@ impl MemoryInfo {
             g_ort().CreateMemoryInfo.unwrap()(
                 CString::from(name.clone()).as_ptr(),
                 allocator_type.clone().into(),
-                id,
+                device_id,
                 mem_type.clone().into(),
                 &mut memory_info_ptr,
             )
@@ -47,11 +50,21 @@ impl MemoryInfo {
 
         Ok(Self {
             ptr: memory_info_ptr,
-            id,
+            device_id,
             name,
             allocator_type,
             mem_type,
         })
+    }
+
+    /// gets the device_id from MemoryInfo
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    /// gets the name from MemoryInfo
+    pub fn name(&self) -> &DeviceName {
+        &self.name
     }
 
     /// gets the AllocatorType from MemoryInfo
@@ -59,32 +72,29 @@ impl MemoryInfo {
         &self.allocator_type
     }
 
-    /// gets the id from MemoryInfo
-    pub fn id(&self) -> i32 {
-        self.id
-    }
-
     /// gets the MemType from MemoryInfo
     pub fn mem_type(&self) -> &MemType {
         &self.mem_type
     }
+}
 
-    /// gets the name from MemoryInfo
-    pub fn name(&self) -> &DeviceName {
-        &self.name
+impl TryFrom<*const sys::OrtMemoryInfo> for MemoryInfo {
+    type Error = OrtError;
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn try_from(memory_info_ptr: *const sys::OrtMemoryInfo) -> Result<Self> {
+        Ok(Self {
+            ptr: memory_info_ptr as *mut sys::OrtMemoryInfo,
+            device_id: unsafe { get_id(memory_info_ptr)? },
+            name: unsafe { get_name(memory_info_ptr)? },
+            allocator_type: unsafe { get_allocator_type(memory_info_ptr)? },
+            mem_type: unsafe { get_mem_type(memory_info_ptr)? },
+        })
     }
 }
 
 #[allow(dead_code)]
-unsafe fn get_allocator_type(memory_info_ptr: *mut sys::OrtMemoryInfo) -> Result<AllocatorType> {
-    let mut allocator_type = sys::OrtAllocatorType::OrtInvalidAllocator;
-    let status = g_ort().MemoryInfoGetType.unwrap()(memory_info_ptr, &mut allocator_type);
-    status_to_result(status).map_err(OrtError::MemoryInfoGetType)?;
-    Ok(allocator_type.into())
-}
-
-#[allow(dead_code)]
-unsafe fn get_id(memory_info_ptr: *mut sys::OrtMemoryInfo) -> Result<i32> {
+unsafe fn get_id(memory_info_ptr: *const sys::OrtMemoryInfo) -> Result<i32> {
     let mut id = 0;
     let status = g_ort().MemoryInfoGetId.unwrap()(memory_info_ptr, &mut id);
     status_to_result(status).map_err(OrtError::MemoryInfoGetId)?;
@@ -92,20 +102,29 @@ unsafe fn get_id(memory_info_ptr: *mut sys::OrtMemoryInfo) -> Result<i32> {
 }
 
 #[allow(dead_code)]
-unsafe fn get_mem_type(memory_info_ptr: *mut sys::OrtMemoryInfo) -> Result<MemType> {
-    let mut mem_type = sys::OrtMemType::OrtMemTypeDefault;
-    let status = g_ort().MemoryInfoGetMemType.unwrap()(memory_info_ptr, &mut mem_type);
-    status_to_result(status).map_err(OrtError::MemoryInfoGetMemType)?;
-    Ok(mem_type.into())
-}
-
-#[allow(dead_code)]
-unsafe fn get_name(memory_info_ptr: *mut sys::OrtMemoryInfo) -> Result<String> {
+unsafe fn get_name(memory_info_ptr: *const sys::OrtMemoryInfo) -> Result<DeviceName> {
     let mut name_ptr: *const c_char = std::ptr::null_mut();
     let status = g_ort().MemoryInfoGetName.unwrap()(memory_info_ptr, &mut name_ptr);
     status_to_result(status).map_err(OrtError::MemoryInfoGetName)?;
     assert_not_null_pointer(name_ptr, "Name")?;
-    Ok(CStr::from_ptr(name_ptr).to_string_lossy().into_owned())
+    let name: String = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+    Ok(DeviceName::from(name.as_str()))
+}
+
+#[allow(dead_code)]
+unsafe fn get_allocator_type(memory_info_ptr: *const sys::OrtMemoryInfo) -> Result<AllocatorType> {
+    let mut allocator_type = sys::OrtAllocatorType::OrtInvalidAllocator;
+    let status = g_ort().MemoryInfoGetType.unwrap()(memory_info_ptr, &mut allocator_type);
+    status_to_result(status).map_err(OrtError::MemoryInfoGetType)?;
+    Ok(allocator_type.into())
+}
+
+#[allow(dead_code)]
+unsafe fn get_mem_type(memory_info_ptr: *const sys::OrtMemoryInfo) -> Result<MemType> {
+    let mut mem_type = sys::OrtMemType::OrtMemTypeDefault;
+    let status = g_ort().MemoryInfoGetMemType.unwrap()(memory_info_ptr, &mut mem_type);
+    status_to_result(status).map_err(OrtError::MemoryInfoGetMemType)?;
+    Ok(mem_type.into())
 }
 
 impl Drop for MemoryInfo {
@@ -114,7 +133,7 @@ impl Drop for MemoryInfo {
         if self.ptr.is_null() {
             error!("MemoryInfo pointer is null, not dropping.");
         } else {
-            trace!("Dropping MemoryInfo.");
+            trace!("Dropping MemoryInfo: {:?}.", self.ptr);
             unsafe { g_ort().ReleaseMemoryInfo.unwrap()(self.ptr) };
         }
 
@@ -125,7 +144,6 @@ impl Drop for MemoryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_log::test;
 
     #[test]
     fn memory_info_constructor_destructor() {

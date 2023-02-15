@@ -6,7 +6,7 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use onnxruntime_sys as sys;
 
@@ -69,6 +69,9 @@ impl Environment {
         EnvBuilder {
             name: "default".into(),
             log_level: LoggingLevel::Warning,
+            global_inter_op_num_threads: None,
+            global_intra_op_num_threads: None,
+            global_spin_control: None,
         }
     }
 
@@ -82,7 +85,7 @@ impl Environment {
     }
 
     #[tracing::instrument]
-    fn new(name: String, log_level: LoggingLevel) -> Result<Environment> {
+    fn new(builder: &EnvBuilder) -> Result<Environment> {
         // NOTE: Because 'G_ENV' is a lazy_static, locking it will, initially, create
         //      a new Arc<Mutex<EnvironmentSingleton>> with a strong count of 1.
         //      Cloning it to embed it inside the 'Environment' to return
@@ -94,36 +97,76 @@ impl Environment {
         if g_env_ptr.is_null() {
             debug!("Environment not yet initialized, creating a new one.");
 
+            let mut threading_options_ptr: *mut sys::OrtThreadingOptions = std::ptr::null_mut();
+            let status =
+                { unsafe { g_ort().CreateThreadingOptions.unwrap()(&mut threading_options_ptr) } };
+            status_to_result(status).map_err(OrtError::ThreadingOptions)?;
+
+            if let Some(inter_op_num_threads) = builder.global_inter_op_num_threads {
+                let status = {
+                    unsafe {
+                        g_ort().SetGlobalInterOpNumThreads.unwrap()(
+                            threading_options_ptr,
+                            inter_op_num_threads as i32,
+                        )
+                    }
+                };
+                status_to_result(status).map_err(OrtError::ThreadingOptions)?;
+            }
+            if let Some(intra_op_num_threads) = builder.global_intra_op_num_threads {
+                let status = {
+                    unsafe {
+                        g_ort().SetGlobalIntraOpNumThreads.unwrap()(
+                            threading_options_ptr,
+                            intra_op_num_threads as i32,
+                        )
+                    }
+                };
+                status_to_result(status).map_err(OrtError::ThreadingOptions)?;
+            }
+            if let Some(spin_control) = builder.global_spin_control {
+                let status = {
+                    unsafe {
+                        g_ort().SetGlobalSpinControl.unwrap()(
+                            threading_options_ptr,
+                            i32::from(spin_control),
+                        )
+                    }
+                };
+                status_to_result(status).map_err(OrtError::ThreadingOptions)?;
+            }
+
             let mut env_ptr: *mut sys::OrtEnv = std::ptr::null_mut();
-
             let logging_function: sys::OrtLoggingFunction = Some(custom_logger);
-            // FIXME: What should go here?
             let logger_param: *mut std::ffi::c_void = std::ptr::null_mut();
-
-            let cname = CString::new(name.clone()).unwrap();
-
-            let create_env_with_custom_logger = g_ort().CreateEnvWithCustomLogger.unwrap();
+            let cname = CString::new(builder.name.clone()).unwrap();
             let status = {
                 unsafe {
-                    create_env_with_custom_logger(
+                    g_ort()
+                        .CreateEnvWithCustomLoggerAndGlobalThreadPools
+                        .unwrap()(
                         logging_function,
                         logger_param,
-                        log_level.into(),
+                        builder.log_level.clone().into(),
                         cname.as_ptr(),
+                        threading_options_ptr,
                         &mut env_ptr,
                     )
                 }
             };
+            status_to_result(status).map_err(OrtError::Environment)?;
 
+            // disable telemetry
+            let status = { unsafe { g_ort().DisableTelemetryEvents.unwrap()(env_ptr) } };
             status_to_result(status).map_err(OrtError::Environment)?;
 
             debug!(
-                env_ptr = format!("{:?}", env_ptr).as_str(),
+                env_ptr = format!("{env_ptr:?}").as_str(),
                 "Environment created."
             );
 
             *g_env_ptr = env_ptr;
-            environment_guard.name = name;
+            environment_guard.name = builder.name.clone();
 
             // NOTE: Cloning the lazy_static 'G_ENV' will increase its strong count by one.
             //       If this 'Environment' is the only one in the process, the strong count
@@ -132,7 +175,7 @@ impl Environment {
             //          * one inside the 'Environment' returned
             Ok(Environment { env: G_ENV.clone() })
         } else {
-            warn!(
+            info!(
                 name = environment_guard.name.as_str(),
                 env_ptr = format!("{:?}", environment_guard.env_ptr).as_str(),
                 "Environment already initialized, reusing it.",
@@ -168,12 +211,12 @@ impl Drop for Environment {
         //       If there is no other environment, the strong count should be two and we
         //       can properly free the sys::OrtEnv pointer.
         if Arc::strong_count(&G_ENV) == 2 {
-            let env_ptr: *mut sys::OrtEnv = *environment_guard.env_ptr.get_mut();
-            if env_ptr.is_null() {
+            let ptr: *mut sys::OrtEnv = *environment_guard.env_ptr.get_mut();
+            if ptr.is_null() {
                 error!("Environment pointer is null, not dropping");
             } else {
-                trace!("Dropping Environment.");
-                unsafe { g_ort().ReleaseEnv.unwrap()(env_ptr) };
+                trace!("Dropping Environment: {:?}.", ptr);
+                unsafe { g_ort().ReleaseEnv.unwrap()(ptr) };
             }
 
             environment_guard.env_ptr = AtomicPtr::new(std::ptr::null_mut());
@@ -190,9 +233,13 @@ impl Drop for Environment {
 ///
 /// **NOTE**: If the same configuration method (for example [`with_name()`](struct.EnvBuilder.html#method.with_name))
 /// is called multiple times, the last value will have precedence.
+#[derive(Debug)]
 pub struct EnvBuilder {
     name: String,
     log_level: LoggingLevel,
+    global_inter_op_num_threads: Option<u16>,
+    global_intra_op_num_threads: Option<u16>,
+    global_spin_control: Option<bool>,
 }
 
 impl EnvBuilder {
@@ -221,9 +268,27 @@ impl EnvBuilder {
         self
     }
 
+    /// Set global inter-op thread count.
+    pub fn with_global_inter_op_num_threads(mut self, inter_op_num_threads: u16) -> EnvBuilder {
+        self.global_inter_op_num_threads = Some(inter_op_num_threads);
+        self
+    }
+
+    /// Set global intra-op thread count.
+    pub fn with_global_intra_op_num_threads(mut self, intra_op_num_threads: u16) -> EnvBuilder {
+        self.global_intra_op_num_threads = Some(intra_op_num_threads);
+        self
+    }
+
+    /// Set global spin control options.
+    pub fn with_global_spin_control(mut self, spin_control: bool) -> EnvBuilder {
+        self.global_spin_control = Some(spin_control);
+        self
+    }
+
     /// Commit the configuration to a new [`Environment`](environment/struct.Environment.html)
     pub fn build(self) -> Result<Environment> {
-        Environment::new(self.name, self.log_level)
+        Environment::new(&self)
     }
 }
 
@@ -231,16 +296,11 @@ impl EnvBuilder {
 mod tests {
     use super::*;
     use std::sync::{RwLock, RwLockWriteGuard};
-    use test_log::test;
 
     impl G_ENV {
         fn is_initialized(&self) -> bool {
             Arc::strong_count(self) >= 2
         }
-
-        // fn name(&self) -> String {
-        //     *self.lock().unwrap().name.clone()
-        // }
 
         fn env_ptr(&self) -> *const sys::OrtEnv {
             *self.lock().unwrap().env_ptr.get_mut()
@@ -258,9 +318,6 @@ mod tests {
     }
 
     impl CONCURRENT_TEST_RUN {
-        // fn run(&self) -> std::sync::RwLockReadGuard<()> {
-        //     self.lock.read().unwrap()
-        // }
         fn single_test_run(&self) -> RwLockWriteGuard<()> {
             self.lock.write().unwrap()
         }
@@ -294,7 +351,7 @@ mod tests {
         let mut prev_env_ptr = G_ENV.env_ptr();
 
         for i in 0..10 {
-            let name = format!("sequential_environment_creation: {}", i);
+            let name = format!("sequential_environment_creation: {i}");
             let env = Environment::builder()
                 .with_name(name.clone())
                 .with_log_level(LoggingLevel::Warning)
@@ -313,13 +370,17 @@ mod tests {
         let _concurrent_run_lock_guard = CONCURRENT_TEST_RUN.single_test_run();
 
         let initial_name = String::from("concurrent_environment_creation");
-        let main_env = Environment::new(initial_name.clone(), LoggingLevel::Warning).unwrap();
+        let main_env = Environment::builder()
+            .with_name(initial_name.clone())
+            .with_log_level(LoggingLevel::Warning)
+            .build()
+            .unwrap();
         let main_env_ptr = main_env.env_ptr() as usize;
 
         let children = (0..10).map(|t| {
             let initial_name_cloned = initial_name.clone();
             std::thread::spawn(move || {
-                let name = format!("concurrent_environment_creation: {}", t);
+                let name = format!("concurrent_environment_creation: {t}");
                 let env = Environment::builder()
                     .with_name(name)
                     .with_log_level(LoggingLevel::Warning)

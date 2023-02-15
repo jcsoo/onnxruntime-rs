@@ -4,17 +4,14 @@ use crate::{
     char_p_to_string,
     environment::Environment,
     error::{
-        assert_not_null_pointer, assert_null_pointer, status_to_result, NonMatchingDimensionsError,
-        OrtApiError, OrtError, Result,
+        assert_not_null_pointer, assert_null_pointer, status_to_result, OrtApiError, OrtError,
+        Result,
     },
     g_ort,
     io_binding::IoBinding,
-    memory::MemoryInfo,
-    tensor::{ort_owned_tensor::OrtOwnedTensorExtractor, OrtTensor},
-    AllocatorType, DeviceName, GraphOptimizationLevel, MemType, TensorElementDataType,
-    TypeToTensorElementDataType, TypedArray, TypedOrtOwnedTensor, TypedOrtTensor,
+    memory_info::MemoryInfo,
+    AllocatorType, DeviceName, GraphOptimizationLevel, MemType, OrtValue, TensorElementDataType,
 };
-use ndarray::Array;
 use onnxruntime_sys as sys;
 use std::collections::HashMap;
 use std::os::raw::c_char;
@@ -52,15 +49,15 @@ use tracing::{error, trace};
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct SessionBuilder<'a> {
-    env: &'a Environment,
+pub struct SessionBuilder<'e> {
+    env: &'e Environment,
     session_options_ptr: *mut sys::OrtSessionOptions,
 
     allocator: AllocatorType,
     memory_type: MemType,
 }
 
-impl<'a> Drop for SessionBuilder<'a> {
+impl<'e> Drop for SessionBuilder<'e> {
     #[tracing::instrument]
     fn drop(&mut self) {
         if self.session_options_ptr.is_null() {
@@ -74,8 +71,8 @@ impl<'a> Drop for SessionBuilder<'a> {
     }
 }
 
-impl<'a> SessionBuilder<'a> {
-    pub(crate) fn new(env: &'a Environment) -> Result<SessionBuilder<'a>> {
+impl<'e> SessionBuilder<'e> {
+    pub(crate) fn new(env: &'e Environment) -> Result<SessionBuilder<'e>> {
         let mut session_options_ptr: *mut sys::OrtSessionOptions = std::ptr::null_mut();
         let status = unsafe { g_ort().CreateSessionOptions.unwrap()(&mut session_options_ptr) };
 
@@ -92,15 +89,12 @@ impl<'a> SessionBuilder<'a> {
     }
 
     /// Configure the session to use a number of threads
-    pub fn with_number_threads(self, num_threads: i16) -> Result<SessionBuilder<'a>> {
-        // FIXME: Pre-built binaries use OpenMP, set env variable instead
-
+    pub fn with_inter_op_num_threads(self, num_threads: u16) -> Result<SessionBuilder<'e>> {
         // We use a u16 in the builder to cover the 16-bits positive values of a i32.
-        let num_threads = num_threads as i32;
-        let status =
-            unsafe { g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
+        let status = unsafe {
+            g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads as i32)
+        };
         status_to_result(status).map_err(OrtError::SessionOptions)?;
-        assert_null_pointer(status, "SessionStatus")?;
         Ok(self)
     }
 
@@ -108,31 +102,48 @@ impl<'a> SessionBuilder<'a> {
     pub fn with_optimization_level(
         self,
         opt_level: GraphOptimizationLevel,
-    ) -> Result<SessionBuilder<'a>> {
+    ) -> Result<SessionBuilder<'e>> {
         // Sets graph optimization level
-        unsafe {
+        let status = unsafe {
             g_ort().SetSessionGraphOptimizationLevel.unwrap()(
                 self.session_options_ptr,
                 opt_level.into(),
             )
         };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
+        Ok(self)
+    }
+
+    /// Set the session's disable per session threads
+    pub fn with_disable_per_session_threads(self) -> Result<SessionBuilder<'e>> {
+        let status = unsafe { g_ort().DisablePerSessionThreads.unwrap()(self.session_options_ptr) };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
         Ok(self)
     }
 
     /// Enable profiling for a session.
-    pub fn with_profiling(self, profile_file_prefix: &str) -> Result<SessionBuilder<'a>> {
-        let profile_file_prefix = CString::new(profile_file_prefix.to_string()).unwrap();
-
+    pub fn with_profiling(
+        self,
+        profile_file_prefix: Option<impl Into<String>>,
+    ) -> Result<SessionBuilder<'e>> {
         let status = unsafe {
-            g_ort().EnableProfiling.unwrap()(self.session_options_ptr, profile_file_prefix.as_ptr())
+            if let Some(profile_file_prefix) = profile_file_prefix {
+                let profile_file_prefix = CString::new(profile_file_prefix.into()).unwrap();
+                g_ort().EnableProfiling.unwrap()(
+                    self.session_options_ptr,
+                    profile_file_prefix.as_ptr(),
+                )
+            } else {
+                g_ort().DisableProfiling.unwrap()(self.session_options_ptr)
+            }
         };
         status_to_result(status).map_err(OrtError::SessionOptions)?;
 
         Ok(self)
     }
 
-    /// Enable profiling for a session.
-    pub fn with_execution_mode(self, exection_mode: ExecutionMode) -> Result<SessionBuilder<'a>> {
+    /// Set ExecutionMode for a session.
+    pub fn with_execution_mode(self, exection_mode: ExecutionMode) -> Result<SessionBuilder<'e>> {
         let status = unsafe {
             g_ort().SetSessionExecutionMode.unwrap()(self.session_options_ptr, exection_mode.into())
         };
@@ -141,18 +152,49 @@ impl<'a> SessionBuilder<'a> {
         Ok(self)
     }
 
+    /// Set MemPattern for a session.
+    pub fn with_mem_pattern(self, mem_pattern: bool) -> Result<SessionBuilder<'e>> {
+        let status = unsafe {
+            if mem_pattern {
+                g_ort().EnableMemPattern.unwrap()(self.session_options_ptr)
+            } else {
+                g_ort().DisableMemPattern.unwrap()(self.session_options_ptr)
+            }
+        };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
+
+        Ok(self)
+    }
+
+    /// Set CpuMemArena for a session.
+    pub fn with_cpu_mem_arena(self, cpu_mem_arena: bool) -> Result<SessionBuilder<'e>> {
+        let status = unsafe {
+            if cpu_mem_arena {
+                g_ort().EnableCpuMemArena.unwrap()(self.session_options_ptr)
+            } else {
+                g_ort().DisableCpuMemArena.unwrap()(self.session_options_ptr)
+            }
+        };
+        status_to_result(status).map_err(OrtError::SessionOptions)?;
+
+        Ok(self)
+    }
+
     /// Set the session to use cpu
-    #[cfg(feature = "cuda")]
-    pub fn with_cpu(self, use_arena: i32) -> Result<SessionBuilder<'a>> {
+    pub fn with_cpu(self, use_arena: bool) -> Result<SessionBuilder<'e>> {
         unsafe {
-            sys::OrtSessionOptionsAppendExecutionProvider_CPU(self.session_options_ptr, use_arena);
-        }
+            sys::OrtSessionOptionsAppendExecutionProvider_CPU(
+                self.session_options_ptr,
+                i32::from(use_arena),
+            );
+        };
+
         Ok(self)
     }
 
     /// Set the session to use cuda
     #[cfg(feature = "cuda")]
-    pub fn with_cuda(self, options: CUDAProviderOptions) -> Result<SessionBuilder<'a>> {
+    pub fn with_cuda(self, options: CUDAProviderOptions) -> Result<SessionBuilder<'e>> {
         unsafe {
             let mut cuda_options_ptr: *mut sys::OrtCUDAProviderOptionsV2 = std::ptr::null_mut();
             let status = g_ort().CreateCUDAProviderOptions.unwrap()(&mut cuda_options_ptr);
@@ -186,7 +228,7 @@ impl<'a> SessionBuilder<'a> {
 
     /// Set the session to use cuda
     #[cfg(feature = "cuda")]
-    pub fn with_tensorrt(self, options: TensorrtProviderOptions) -> Result<SessionBuilder<'a>> {
+    pub fn with_tensorrt(self, options: TensorrtProviderOptions) -> Result<SessionBuilder<'e>> {
         unsafe {
             let mut trt_options_ptr: *mut sys::OrtTensorRTProviderOptionsV2 = std::ptr::null_mut();
             let status = g_ort().CreateTensorRTProviderOptions.unwrap()(&mut trt_options_ptr);
@@ -221,7 +263,7 @@ impl<'a> SessionBuilder<'a> {
     /// Set the session's allocator
     ///
     /// Defaults to [`AllocatorType::Arena`](../enum.AllocatorType.html#variant.Arena)
-    pub fn with_allocator(mut self, allocator: AllocatorType) -> Result<SessionBuilder<'a>> {
+    pub fn with_allocator(mut self, allocator: AllocatorType) -> Result<SessionBuilder<'e>> {
         self.allocator = allocator;
         Ok(self)
     }
@@ -229,7 +271,7 @@ impl<'a> SessionBuilder<'a> {
     /// Set the session's memory type
     ///
     /// Defaults to [`MemType::Default`](../enum.MemType.html#variant.Default)
-    pub fn with_memory_type(mut self, memory_type: MemType) -> Result<SessionBuilder<'a>> {
+    pub fn with_memory_type(mut self, memory_type: MemType) -> Result<SessionBuilder<'e>> {
         self.memory_type = memory_type;
         Ok(self)
     }
@@ -239,15 +281,15 @@ impl<'a> SessionBuilder<'a> {
 
     /// Load an ONNX graph from a file and commit the session
     #[tracing::instrument]
-    pub fn with_model_from_file<P>(self, model_filepath_ref: P) -> Result<Session<'a>>
+    pub fn with_model_from_file<P>(self, model_filepath_ref: P) -> Result<Session<'e>>
     where
-        P: AsRef<Path> + Debug + 'a,
+        P: AsRef<Path> + Debug + 'e,
     {
         let model_filepath = model_filepath_ref.as_ref();
         let mut session_ptr: *mut sys::OrtSession = std::ptr::null_mut();
 
         if !model_filepath.exists() {
-            return Err(OrtError::FileDoesNotExists {
+            return Err(OrtError::FileDoesNotExist {
                 filename: model_filepath.to_path_buf(),
             });
         }
@@ -312,15 +354,16 @@ impl<'a> SessionBuilder<'a> {
     }
 
     /// Load an ONNX graph from memory and commit the session
-    pub fn with_model_from_memory<B>(self, model_bytes: B) -> Result<Session<'a>>
+    #[tracing::instrument(skip(model_bytes))]
+    pub fn with_model_from_memory<B>(self, model_bytes: B) -> Result<Session<'e>>
     where
-        B: AsRef<[u8]>,
+        B: AsRef<[u8]> + Debug,
     {
         self.with_model_from_memory_monomorphized(model_bytes.as_ref())
     }
 
-    #[tracing::instrument]
-    fn with_model_from_memory_monomorphized(self, model_bytes: &[u8]) -> Result<Session<'a>> {
+    #[tracing::instrument(skip(model_bytes))]
+    fn with_model_from_memory_monomorphized(self, model_bytes: &[u8]) -> Result<Session<'e>> {
         let mut session_ptr: *mut sys::OrtSession = std::ptr::null_mut();
 
         let env_ptr: *const sys::OrtEnv = self.env.env_ptr();
@@ -464,15 +507,10 @@ impl CUDAProviderOptions {
                 CuDNNConvAlgoSearch::Default => "DEFAULT",
             }
             .to_string(),
-            (if self.do_copy_in_default_stream { 1 } else { 0 }).to_string(),
-            (if self.cudnn_conv_use_max_workspace {
-                1
-            } else {
-                0
-            })
-            .to_string(),
-            (if self.cudnn_conv1d_pad_to_nc1d { 1 } else { 0 }).to_string(),
-            (if self.enable_cuda_graph { 1 } else { 0 }).to_string(),
+            i32::from(self.do_copy_in_default_stream).to_string(),
+            i32::from(self.cudnn_conv_use_max_workspace).to_string(),
+            i32::from(self.cudnn_conv1d_pad_to_nc1d).to_string(),
+            i32::from(self.enable_cuda_graph).to_string(),
         ]
         .into_iter()
         .map(|k| CString::new(k).unwrap())
@@ -563,32 +601,39 @@ pub struct TensorrtProviderOptions {
     /// The device ID.
     device_id: usize,
     /// The maximum workspace size for TensorRT engine.
-    trt_max_workspace_size: usize,
+    max_workspace_size: usize,
     /// The maximum number of iterations allowed in model partitioning for TensorRT.
-    trt_max_partition_iterations: usize,
+    max_partition_iterations: usize,
     /// The minimum node size in a subgraph after partitioning.
-    trt_min_subgraph_size: usize,
+    min_subgraph_size: usize,
     /// Enable FP16 mode in TensorRT.
-    trt_fp16_enable: bool,
+    fp16_enable: bool,
     /// Enable FP16 mode in TensorRT.
-    trt_int8_enable: bool,
+    int8_enable: bool,
     /// Specify INT8 calibration table file for non-QDQ models in INT8 mode.
-    trt_int8_calibration_table_name: Option<String>,
+    int8_calibration_table_name: Option<String>,
     ///  Select what calibration table is used for non-QDQ models in INT8 mode.
-    /// If 1, native TensorRT generated calibration table is used; if 0, ONNXRUNTIME tool generated calibration table is used.
-    trt_int8_use_native_calibration_table: bool,
+    /// If true, native TensorRT generated calibration table is used
+    /// If false, ONNXRUNTIME tool generated calibration table is used.
+    int8_use_native_calibration_table: bool,
     /// Enable Deep Learning Accelerator (DLA).
-    trt_dla_enable: bool,
+    dla_enable: bool,
     /// Specify DLA core to execute on.
-    trt_dla_core: usize,
+    dla_core: usize,
     /// Enable TensorRT engine caching.
-    trt_engine_cache_enable: bool,
+    engine_cache_enable: bool,
     /// Specify path for TensorRT engine and profile files.
-    trt_engine_cache_path: Option<String>,
+    engine_cache_path: Option<String>,
     /// Dumps the subgraphs that are transformed into TRT engines in onnx format to the filesystem.
-    trt_dump_subgraphs: bool,
+    dump_subgraphs: bool,
     /// Sequentially build TensorRT engines across provider instances in multi-GPU environment.
-    trt_force_sequential_engine_build: bool,
+    force_sequential_engine_build: bool,
+    /// Enable context memory sharing between subgraphs.
+    #[cfg(feature = "ort_1_14_0")]
+    context_memory_sharing_enable: bool,
+    /// Force Pow + Reduce ops in layer norm to FP32.
+    #[cfg(feature = "ort_1_14_0")]
+    layer_norm_fp32_fallback: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -596,19 +641,23 @@ impl Default for TensorrtProviderOptions {
     fn default() -> Self {
         Self {
             device_id: 0,
-            trt_max_workspace_size: 1073741824,
-            trt_max_partition_iterations: 1000,
-            trt_min_subgraph_size: 1,
-            trt_fp16_enable: false,
-            trt_int8_enable: false,
-            trt_int8_calibration_table_name: None,
-            trt_int8_use_native_calibration_table: false,
-            trt_dla_enable: false,
-            trt_dla_core: 0,
-            trt_engine_cache_enable: false,
-            trt_engine_cache_path: None,
-            trt_dump_subgraphs: false,
-            trt_force_sequential_engine_build: false,
+            max_workspace_size: 1073741824,
+            max_partition_iterations: 1000,
+            min_subgraph_size: 1,
+            fp16_enable: false,
+            int8_enable: false,
+            int8_calibration_table_name: None,
+            int8_use_native_calibration_table: false,
+            dla_enable: false,
+            dla_core: 0,
+            engine_cache_enable: false,
+            engine_cache_path: None,
+            dump_subgraphs: false,
+            force_sequential_engine_build: false,
+            #[cfg(feature = "ort_1_14_0")]
+            context_memory_sharing_enable: false,
+            #[cfg(feature = "ort_1_14_0")]
+            layer_norm_fp32_fallback: false,
         }
     }
 }
@@ -634,42 +683,54 @@ impl TensorrtProviderOptions {
         .map(|k| CString::new(k).unwrap())
         .collect::<Vec<_>>();
 
+        #[cfg(feature = "ort_1_14_0")]
+        keys.append(
+            &mut vec![
+                "trt_context_memory_sharing_enable",
+                "trt_layer_norm_fp32_fallback",
+            ]
+            .into_iter()
+            .map(|k| CString::new(k).unwrap())
+            .collect::<Vec<_>>(),
+        );
+
         let mut values = vec![
             self.device_id.to_string(),
-            self.trt_max_workspace_size.to_string(),
-            self.trt_max_partition_iterations.to_string(),
-            self.trt_min_subgraph_size.to_string(),
-            (if self.trt_fp16_enable { 1 } else { 0 }).to_string(),
-            (if self.trt_int8_enable { 1 } else { 0 }).to_string(),
-            (if self.trt_int8_use_native_calibration_table {
-                1
-            } else {
-                0
-            })
-            .to_string(),
-            (if self.trt_dla_enable { 1 } else { 0 }).to_string(),
-            self.trt_dla_core.to_string(),
-            (if self.trt_engine_cache_enable { 1 } else { 0 }).to_string(),
-            (if self.trt_dump_subgraphs { 1 } else { 0 }).to_string(),
-            (if self.trt_force_sequential_engine_build {
-                1
-            } else {
-                0
-            })
-            .to_string(),
+            self.max_workspace_size.to_string(),
+            self.max_partition_iterations.to_string(),
+            self.min_subgraph_size.to_string(),
+            i32::from(self.fp16_enable).to_string(),
+            i32::from(self.int8_enable).to_string(),
+            i32::from(self.int8_use_native_calibration_table).to_string(),
+            i32::from(self.dla_enable).to_string(),
+            self.dla_core.to_string(),
+            i32::from(self.engine_cache_enable).to_string(),
+            i32::from(self.dump_subgraphs).to_string(),
+            i32::from(self.force_sequential_engine_build).to_string(),
         ]
         .into_iter()
         .map(|k| CString::new(k).unwrap())
         .collect::<Vec<_>>();
 
-        if let Some(trt_engine_cache_path) = &self.trt_engine_cache_path {
+        #[cfg(feature = "ort_1_14_0")]
+        values.append(
+            &mut vec![
+                i32::from(self.context_memory_sharing_enable).to_string(),
+                i32::from(self.layer_norm_fp32_fallback).to_string(),
+            ]
+            .into_iter()
+            .map(|k| CString::new(k).unwrap())
+            .collect::<Vec<_>>(),
+        );
+
+        if let Some(engine_cache_path) = &self.engine_cache_path {
             keys.push(CString::new("trt_engine_cache_path").unwrap());
-            values.push(CString::new(trt_engine_cache_path.clone()).unwrap());
+            values.push(CString::new(engine_cache_path.clone()).unwrap());
         };
 
-        if let Some(trt_int8_calibration_table_name) = &self.trt_int8_calibration_table_name {
+        if let Some(int8_calibration_table_name) = &self.int8_calibration_table_name {
             keys.push(CString::new("trt_int8_calibration_table_name").unwrap());
-            values.push(CString::new(trt_int8_calibration_table_name.clone()).unwrap());
+            values.push(CString::new(int8_calibration_table_name.clone()).unwrap());
         };
 
         (keys, values)
@@ -682,93 +743,106 @@ impl TensorrtProviderOptions {
     }
 
     /// Set trt_max_workspace_size
-    pub fn with_trt_max_workspace_size(mut self, trt_max_workspace_size: usize) -> Self {
-        self.trt_max_workspace_size = trt_max_workspace_size;
+    pub fn with_max_workspace_size(mut self, max_workspace_size: usize) -> Self {
+        self.max_workspace_size = max_workspace_size;
         self
     }
 
     /// Set trt_max_partition_iterations
-    pub fn with_trt_max_partition_iterations(
+    pub fn with_max_partition_iterations(mut self, max_partition_iterations: usize) -> Self {
+        self.max_partition_iterations = max_partition_iterations;
+        self
+    }
+
+    /// Set min_subgraph_size
+    pub fn with_min_subgraph_size(mut self, min_subgraph_size: usize) -> Self {
+        self.min_subgraph_size = min_subgraph_size;
+        self
+    }
+
+    /// Set fp16_enable
+    pub fn with_fp16_enable(mut self, fp16_enable: bool) -> Self {
+        self.fp16_enable = fp16_enable;
+        self
+    }
+
+    /// Set int8_enable
+    pub fn with_int8_enable(mut self, int8_enable: bool) -> Self {
+        self.int8_enable = int8_enable;
+        self
+    }
+
+    /// Set int8_calibration_table_name
+    pub fn with_int8_calibration_table_name(
         mut self,
-        trt_max_partition_iterations: usize,
+        int8_calibration_table_name: Option<&str>,
     ) -> Self {
-        self.trt_max_partition_iterations = trt_max_partition_iterations;
+        self.int8_calibration_table_name = int8_calibration_table_name.map(|v| v.to_string());
         self
     }
 
-    /// Set trt_min_subgraph_size
-    pub fn with_trt_min_subgraph_size(mut self, trt_min_subgraph_size: usize) -> Self {
-        self.trt_min_subgraph_size = trt_min_subgraph_size;
-        self
-    }
-
-    /// Set trt_fp16_enable
-    pub fn with_trt_fp16_enable(mut self, trt_fp16_enable: bool) -> Self {
-        self.trt_fp16_enable = trt_fp16_enable;
-        self
-    }
-
-    /// Set trt_int8_enable
-    pub fn with_trt_int8_enable(mut self, trt_int8_enable: bool) -> Self {
-        self.trt_int8_enable = trt_int8_enable;
-        self
-    }
-
-    /// Set trt_int8_calibration_table_name
-    pub fn with_trt_int8_calibration_table_name(
+    /// Set int8_use_native_calibration_table
+    pub fn with_int8_use_native_calibration_table(
         mut self,
-        trt_int8_calibration_table_name: Option<&str>,
+        int8_use_native_calibration_table: bool,
     ) -> Self {
-        self.trt_int8_calibration_table_name =
-            trt_int8_calibration_table_name.map(|v| v.to_string());
+        self.int8_use_native_calibration_table = int8_use_native_calibration_table;
         self
     }
 
-    /// Set trt_int8_use_native_calibration_table
-    pub fn with_trt_int8_use_native_calibration_table(
+    /// Set dla_enable
+    pub fn with_dla_enable(mut self, dla_enable: bool) -> Self {
+        self.dla_enable = dla_enable;
+        self
+    }
+
+    /// Set dla_core
+    pub fn with_dla_core(mut self, dla_core: usize) -> Self {
+        self.dla_core = dla_core;
+        self
+    }
+
+    /// Set engine_cache_enable
+    pub fn with_engine_cache_enable(mut self, engine_cache_enable: bool) -> Self {
+        self.engine_cache_enable = engine_cache_enable;
+        self
+    }
+
+    /// Set engine_cache_path
+    pub fn with_engine_cache_path(mut self, engine_cache_path: Option<&str>) -> Self {
+        self.engine_cache_path = engine_cache_path.map(|v| v.to_string());
+        self
+    }
+
+    /// Set dump_subgraphs
+    pub fn with_dump_subgraphs(mut self, dump_subgraphs: bool) -> Self {
+        self.dump_subgraphs = dump_subgraphs;
+        self
+    }
+
+    /// Set force_sequential_engine_build
+    pub fn with_force_sequential_engine_build(
         mut self,
-        trt_int8_use_native_calibration_table: bool,
+        force_sequential_engine_build: bool,
     ) -> Self {
-        self.trt_int8_use_native_calibration_table = trt_int8_use_native_calibration_table;
+        self.force_sequential_engine_build = force_sequential_engine_build;
         self
     }
 
-    /// Set trt_dla_enable
-    pub fn with_trt_dla_enable(mut self, trt_dla_enable: bool) -> Self {
-        self.trt_dla_enable = trt_dla_enable;
-        self
-    }
-
-    /// Set trt_dla_core
-    pub fn with_trt_dla_core(mut self, trt_dla_core: usize) -> Self {
-        self.trt_dla_core = trt_dla_core;
-        self
-    }
-
-    /// Set trt_engine_cache_enable
-    pub fn with_trt_engine_cache_enable(mut self, trt_engine_cache_enable: bool) -> Self {
-        self.trt_engine_cache_enable = trt_engine_cache_enable;
-        self
-    }
-
-    /// Set trt_engine_cache_path
-    pub fn with_trt_engine_cache_path(mut self, trt_engine_cache_path: Option<&str>) -> Self {
-        self.trt_engine_cache_path = trt_engine_cache_path.map(|v| v.to_string());
-        self
-    }
-
-    /// Set trt_dump_subgraphs
-    pub fn with_trt_dump_subgraphs(mut self, trt_dump_subgraphs: bool) -> Self {
-        self.trt_dump_subgraphs = trt_dump_subgraphs;
-        self
-    }
-
-    /// Set trt_force_sequential_engine_build
-    pub fn with_trt_force_sequential_engine_build(
+    /// Set context_memory_sharing_enable
+    #[cfg(feature = "ort_1_14_0")]
+    pub fn with_context_memory_sharing_enable(
         mut self,
-        trt_force_sequential_engine_build: bool,
+        context_memory_sharing_enable: bool,
     ) -> Self {
-        self.trt_force_sequential_engine_build = trt_force_sequential_engine_build;
+        self.context_memory_sharing_enable = context_memory_sharing_enable;
+        self
+    }
+
+    /// Set layer_norm_fp32_fallback
+    #[cfg(feature = "ort_1_14_0")]
+    pub fn with_layer_norm_fp32_fallback(mut self, layer_norm_fp32_fallback: bool) -> Self {
+        self.layer_norm_fp32_fallback = layer_norm_fp32_fallback;
         self
     }
 }
@@ -776,8 +850,8 @@ impl TensorrtProviderOptions {
 /// Type storing the session information, built from an [`Environment`](environment/struct.Environment.html)
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct Session<'a> {
-    env: &'a Environment,
+pub struct Session<'e> {
+    env: &'e Environment,
     pub(crate) ptr: *mut sys::OrtSession,
     pub(crate) allocator_ptr: *mut sys::OrtAllocator,
     pub(crate) memory_info: MemoryInfo,
@@ -787,8 +861,8 @@ pub struct Session<'a> {
     pub outputs: HashMap<String, Output>,
 }
 
-unsafe impl<'a> Send for Session<'a> {}
-unsafe impl<'a> Sync for Session<'a> {}
+unsafe impl<'e> Send for Session<'e> {}
+unsafe impl<'e> Sync for Session<'e> {}
 
 /// Information about an ONNX's input as stored in loaded file
 #[derive(Clone, Debug)]
@@ -838,13 +912,13 @@ impl Output {
     }
 }
 
-impl<'a> Drop for Session<'a> {
+impl<'e> Drop for Session<'e> {
     #[tracing::instrument]
     fn drop(&mut self) {
         if self.ptr.is_null() {
             error!("Session pointer is null, not dropping");
         } else {
-            trace!("Dropping Session.");
+            trace!("Dropping Session: {:?}.", self.ptr);
             unsafe { g_ort().ReleaseSession.unwrap()(self.ptr) };
         }
 
@@ -853,106 +927,46 @@ impl<'a> Drop for Session<'a> {
     }
 }
 
-impl<'a> Session<'a> {
+impl<'e> Session<'e> {
     /// Run the input data through the ONNX graph, performing inference.
     ///
     /// Note that ONNX models can have multiple inputs; a `Vec<>` is thus
     /// used for the input data here.
     #[tracing::instrument]
-    pub fn run<'s, 't, 'm, D>(
+    pub fn run<'s, 't, 'm, S>(
         &'s self,
-        inputs: HashMap<String, TypedArray<D>>,
-    ) -> Result<HashMap<String, TypedOrtOwnedTensor<ndarray::Dim<ndarray::IxDynImpl>>>>
+        inputs: HashMap<S, &OrtValue>,
+    ) -> Result<HashMap<String, OrtValue>>
     where
-        D: ndarray::Dimension,
         'm: 't, // 'm outlives 't (memory info outlives tensor)
         's: 'm, // 's outlives 'm (session outlives memory info)
+        S: Into<String> + Clone + Debug,
     {
         // self.validate_untyped_input_shapes(&inputs)?;
 
         // Build arguments to Run()
         let input_names_ptr: Vec<*const c_char> = inputs
-            .iter()
-            .map(|(name, _)| name.clone())
+            .keys()
+            .cloned()
+            .map(|n| CString::new(n.into()).unwrap())
+            .map(|n| n.into_raw() as *const c_char)
+            .collect();
+
+        let output_names_ptr: Vec<*const c_char> = self
+            .outputs
+            .keys()
+            .cloned()
             .map(|n| CString::new(n).unwrap())
             .map(|n| n.into_raw() as *const c_char)
             .collect();
 
-        let output_names_cstring: Vec<CString> = self
-            .outputs
-            .iter()
-            .map(|(name, _)| name.clone())
-            .map(|n| CString::new(n).unwrap())
-            .collect();
-        let output_names_ptr: Vec<*const c_char> = output_names_cstring
-            .iter()
-            .map(|n| n.as_ptr() as *const c_char)
-            .collect();
+        let input_ort_values = inputs
+            .values()
+            .map(|input| input.ptr as *const sys::OrtValue)
+            .collect::<Vec<_>>();
 
-        // The C API expects pointers for the arrays (pointers to C-arrays)
-        let input_ort_tensors: Vec<TypedOrtTensor<D>> = inputs
-            .into_iter()
-            .map(|(_, input_array)| match input_array {
-                TypedArray::F32(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::F32(t))
-                }
-                TypedArray::U8(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::U8(t))
-                }
-                TypedArray::I8(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::I8(t))
-                }
-                TypedArray::U16(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::U16(t))
-                }
-                TypedArray::I16(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::I16(t))
-                }
-                TypedArray::I32(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::I32(t))
-                }
-                TypedArray::I64(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::I64(t))
-                }
-                TypedArray::F64(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::F64(t))
-                }
-                TypedArray::U32(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::U32(t))
-                }
-                TypedArray::U64(input_array) => {
-                    OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
-                        .map(|t| TypedOrtTensor::U64(t))
-                }
-            })
-            .collect::<Result<Vec<TypedOrtTensor<D>>>>()?;
-        let input_ort_values: Vec<*const sys::OrtValue> = input_ort_tensors
-            .iter()
-            .map(|input_array_ort| match input_array_ort {
-                TypedOrtTensor::F32(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::U8(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::I8(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::U16(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::I16(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::I32(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::I64(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::F64(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::U32(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-                TypedOrtTensor::U64(input_array_ort) => input_array_ort.ptr as *const sys::OrtValue,
-            })
-            .collect();
-
-        let mut output_tensor_extractors_ptrs: Vec<*mut sys::OrtValue> =
-            vec![std::ptr::null_mut(); output_names_cstring.len()];
+        let mut output_ort_values: Vec<*mut sys::OrtValue> =
+            vec![std::ptr::null_mut(); output_names_ptr.len()];
 
         let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
 
@@ -965,57 +979,21 @@ impl<'a> Session<'a> {
                 input_ort_values.len(),
                 output_names_ptr.as_ptr(),
                 output_names_ptr.len(),
-                output_tensor_extractors_ptrs.as_mut_ptr(),
+                output_ort_values.as_mut_ptr(),
             )
         };
         status_to_result(status).map_err(OrtError::Run)?;
 
-        let memory_info_ref = &self.memory_info;
-        let outputs = output_tensor_extractors_ptrs
-            .into_iter()
-            .zip(&self.outputs)
-            .filter_map(|(ptr, (output_name, output))| {
-                let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-                let status = unsafe {
-                    g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
-                };
-                status_to_result(status)
-                    .map_err(OrtError::GetTensorTypeAndShape)
-                    .unwrap();
-
-                let dims = get_tensor_dimensions(tensor_info_ptr).unwrap();
-                unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
-                let dims: Vec<_> = dims.iter().map(|&n| n as usize).collect();
-
-                (!dims.contains(&0)).then(|| {
-                    let mut output_tensor_extractor =
-                        OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
-                    output_tensor_extractor.ptr = ptr;
-                    let ort_owned_tensor = output_tensor_extractor.extract(output)?;
-
-                    Ok((output_name.clone(), ort_owned_tensor))
-                })
-            })
-            .collect::<Result<HashMap<String, TypedOrtOwnedTensor<_>>>>();
-
-        // Reconvert to CString so drop impl is called and memory is freed
-        let cstrings: Result<Vec<CString>> = input_names_ptr
-            .into_iter()
-            .map(|p| {
-                assert_not_null_pointer(p, "i8 for CString")?;
-                unsafe { Ok(CString::from_raw(p as *mut c_char)) }
-            })
-            .collect();
-        cstrings?;
-
-        outputs
+        Ok(self
+            .outputs
+            .keys()
+            .zip(output_ort_values.into_iter())
+            .map(|(name, value)| (name.to_owned(), value.into()))
+            .collect::<HashMap<_, _>>())
     }
 
     /// Run the input data through the ONNX graph, performing inference.
-    pub fn run_with_iobinding<D>(&self, io_binding: &IoBinding<D>) -> Result<()>
-    where
-        D: ndarray::Dimension,
-    {
+    pub fn run_with_iobinding(&self, io_binding: &IoBinding) -> Result<()> {
         let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
         let status =
             unsafe { g_ort().RunWithBinding.unwrap()(self.ptr, run_options_ptr, io_binding.ptr) };
@@ -1023,365 +1001,18 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    // pub fn tensor_from_array<'a, 'b, T, D>(&'a self, array: Array<T, D>) -> Tensor<'b, T, D>
-    // where
-    //     'a: 'b, // 'a outlives 'b
-    // {
-    //     Tensor::from_array(self, array)
-    // }
-
-    fn validate_input_shape<TIn, D, DEB>(
-        &self,
-        input_array: &Array<TIn, D>,
-        input: &Input,
-        input_arrays_dimensions: &[Vec<usize>],
-        input_arrays: &[DEB],
-    ) -> Result<()>
-    where
-        TIn: TypeToTensorElementDataType + Debug + Clone,
-        D: ndarray::Dimension,
-        DEB: Debug,
-    {
-        // Verify length
-        if input_array.shape().len() != input.dimensions.len() {
-            error!(
-                "Different input lengths: {:?} vs {:?}",
-                self.inputs, input_arrays
-            );
-            return Err(OrtError::NonMatchingDimensions(
-                NonMatchingDimensionsError::InputsLength {
-                    inference_input: input_arrays_dimensions.to_vec(),
-                    model_input: self
-                        .inputs
-                        .iter()
-                        .map(|(_, input)| input.dimensions.clone())
-                        .collect(),
-                },
-            ));
-        }
-
-        // Verify shape
-        let inputs_different_shape =
-            input_array
-                .shape()
-                .iter()
-                .zip(input.dimensions.iter())
-                .any(|(l2, r2)| match r2 {
-                    Some(r3) => *r3 as usize != *l2,
-                    None => false, // None means dynamic size; in that case shape always match
-                });
-        if inputs_different_shape {
-            error!(
-                "Different input lengths: {:?} vs {:?}",
-                self.inputs, input_arrays
-            );
-            return Err(OrtError::NonMatchingDimensions(
-                NonMatchingDimensionsError::InputsLength {
-                    inference_input: input_arrays_dimensions.to_vec(),
-                    model_input: self
-                        .inputs
-                        .iter()
-                        .map(|(_, input)| input.dimensions.clone())
-                        .collect(),
-                },
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn validate_untyped_input_shapes<D: ndarray::Dimension>(
-        &mut self,
-        input_arrays: &[TypedArray<D>],
-    ) -> Result<()> {
-        // ******************************************************************
-        // FIXME: Properly handle errors here
-        // Make sure all dimensions match (except dynamic ones)
-
-        // Verify length of inputs
-        if input_arrays.len() != self.inputs.len() {
-            error!(
-                "Non-matching number of inputs: {} (inference) vs {} (model)",
-                input_arrays.len(),
-                self.inputs.len()
-            );
-            return Err(OrtError::NonMatchingDimensions(
-                NonMatchingDimensionsError::InputsCount {
-                    inference_input_count: 0,
-                    model_input_count: 0,
-                    inference_input: input_arrays
-                        .iter()
-                        .map(|input_array| match input_array {
-                            TypedArray::F32(array) => array.shape().to_vec(),
-                            TypedArray::U8(array) => array.shape().to_vec(),
-                            TypedArray::I8(array) => array.shape().to_vec(),
-                            TypedArray::U16(array) => array.shape().to_vec(),
-                            TypedArray::I16(array) => array.shape().to_vec(),
-                            TypedArray::I32(array) => array.shape().to_vec(),
-                            TypedArray::I64(array) => array.shape().to_vec(),
-                            TypedArray::F64(array) => array.shape().to_vec(),
-                            TypedArray::U32(array) => array.shape().to_vec(),
-                            TypedArray::U64(array) => array.shape().to_vec(),
-                        })
-                        .collect(),
-                    model_input: self
-                        .inputs
-                        .iter()
-                        .map(|(_, input)| input.dimensions.clone())
-                        .collect(),
-                },
-            ));
-        }
-
-        // Verify length of each individual inputs
-        let inputs_different_length = input_arrays
-            .iter()
-            .zip(self.inputs.iter())
-            .any(|(l, (_, r))| match l {
-                TypedArray::F32(array) => array.shape().len(),
-                TypedArray::U8(array) => array.shape().len(),
-                TypedArray::I8(array) => array.shape().len(),
-                TypedArray::U16(array) => array.shape().len(),
-                TypedArray::I16(array) => array.shape().len(),
-                TypedArray::I32(array) => array.shape().len(),
-                TypedArray::I64(array) => array.shape().len(),
-                TypedArray::F64(array) => array.shape().len(),
-                TypedArray::U32(array) => array.shape().len(),
-                TypedArray::U64(array) => array.shape().len(),
-            } != r.dimensions.len());
-
-        if inputs_different_length {
-            error!(
-                "Different input lengths: {:?} vs {:?}",
-                self.inputs, input_arrays
-            );
-            return Err(OrtError::NonMatchingDimensions(
-                NonMatchingDimensionsError::InputsLength {
-                    inference_input: input_arrays
-                        .iter()
-                        .map(|input_array| match input_array {
-                            TypedArray::F32(array) => array.shape().to_vec(),
-                            TypedArray::U8(array) => array.shape().to_vec(),
-                            TypedArray::I8(array) => array.shape().to_vec(),
-                            TypedArray::U16(array) => array.shape().to_vec(),
-                            TypedArray::I16(array) => array.shape().to_vec(),
-                            TypedArray::I32(array) => array.shape().to_vec(),
-                            TypedArray::I64(array) => array.shape().to_vec(),
-                            TypedArray::F64(array) => array.shape().to_vec(),
-                            TypedArray::U32(array) => array.shape().to_vec(),
-                            TypedArray::U64(array) => array.shape().to_vec(),
-                        })
-                        .collect(),
-                    model_input: self
-                        .inputs
-                        .iter()
-                        .map(|(_, input)| input.dimensions.clone())
-                        .collect(),
-                },
-            ));
-        }
-
-        let input_arrays_dimensions = input_arrays
-            .iter()
-            .map(|input_array| match input_array {
-                TypedArray::F32(input_array) => input_array.shape().to_vec(),
-                TypedArray::U8(input_array) => input_array.shape().to_vec(),
-                TypedArray::I8(input_array) => input_array.shape().to_vec(),
-                TypedArray::U16(input_array) => input_array.shape().to_vec(),
-                TypedArray::I16(input_array) => input_array.shape().to_vec(),
-                TypedArray::I32(input_array) => input_array.shape().to_vec(),
-                TypedArray::I64(input_array) => input_array.shape().to_vec(),
-                TypedArray::F64(input_array) => input_array.shape().to_vec(),
-                TypedArray::U32(input_array) => input_array.shape().to_vec(),
-                TypedArray::U64(input_array) => input_array.shape().to_vec(),
-            })
-            .collect::<Vec<_>>();
-
-        for (input_array, (_, input)) in input_arrays.iter().zip(self.inputs.iter()) {
-            match input_array {
-                TypedArray::F32(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::U8(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::I8(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::U16(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::I16(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::I32(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::I64(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::F64(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::U32(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-                TypedArray::U64(input_array) => self.validate_input_shape(
-                    input_array,
-                    input,
-                    &input_arrays_dimensions,
-                    input_arrays,
-                ),
-            }?;
-        }
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn validate_input_shapes<TIn, D>(&mut self, input_arrays: &[Array<TIn, D>]) -> Result<()>
-    where
-        TIn: TypeToTensorElementDataType + Debug + Clone,
-        D: ndarray::Dimension,
-    {
-        // ******************************************************************
-        // FIXME: Properly handle errors here
-        // Make sure all dimensions match (except dynamic ones)
-
-        // Verify length of inputs
-        if input_arrays.len() != self.inputs.len() {
-            error!(
-                "Non-matching number of inputs: {} (inference) vs {} (model)",
-                input_arrays.len(),
-                self.inputs.len()
-            );
-            return Err(OrtError::NonMatchingDimensions(
-                NonMatchingDimensionsError::InputsCount {
-                    inference_input_count: 0,
-                    model_input_count: 0,
-                    inference_input: input_arrays
-                        .iter()
-                        .map(|input_array| input_array.shape().to_vec())
-                        .collect(),
-                    model_input: self
-                        .inputs
-                        .iter()
-                        .map(|(_, input)| input.dimensions.clone())
-                        .collect(),
-                },
-            ));
-        }
-
-        // Verify length of each individual inputs
-        let inputs_different_length = input_arrays
-            .iter()
-            .zip(self.inputs.iter())
-            .any(|(l, (_, r))| l.shape().len() != r.dimensions.len());
-        if inputs_different_length {
-            error!(
-                "Different input lengths: {:?} vs {:?}",
-                self.inputs, input_arrays
-            );
-            return Err(OrtError::NonMatchingDimensions(
-                NonMatchingDimensionsError::InputsLength {
-                    inference_input: input_arrays
-                        .iter()
-                        .map(|input_array| input_array.shape().to_vec())
-                        .collect(),
-                    model_input: self
-                        .inputs
-                        .iter()
-                        .map(|(_, input)| input.dimensions.clone())
-                        .collect(),
-                },
-            ));
-        }
-
-        let input_arrays_dimensions = input_arrays
-            .iter()
-            .map(|input_array| input_array.shape().to_vec())
-            .collect::<Vec<_>>();
-
-        for (input_array, (_, input)) in input_arrays.iter().zip(self.inputs.iter()) {
-            self.validate_input_shape(input_array, input, &input_arrays_dimensions, input_arrays)?;
-        }
-
-        Ok(())
-    }
-
     /// Create or return the session [`IoBinding`](../io_binding/struct.IoBinding.html)
-    pub fn io_binding<D>(&self) -> Result<IoBinding<D>>
-    where
-        D: ndarray::Dimension,
-    {
+    pub fn io_binding(&self) -> Result<IoBinding> {
         unsafe { IoBinding::new(self) }
     }
-}
-
-pub(crate) fn get_tensor_dimensions(
-    tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo,
-) -> Result<Vec<i64>> {
-    let mut num_dims = 0;
-    let status = unsafe { g_ort().GetDimensionsCount.unwrap()(tensor_info_ptr, &mut num_dims) };
-    status_to_result(status).map_err(OrtError::GetDimensionsCount)?;
-    (num_dims != 0)
-        .then(|| ())
-        .ok_or(OrtError::InvalidDimensions)?;
-
-    let mut node_dims: Vec<i64> = vec![0; num_dims as usize];
-    let status = unsafe {
-        g_ort().GetDimensions.unwrap()(tensor_info_ptr, node_dims.as_mut_ptr(), num_dims)
-    };
-    status_to_result(status).map_err(OrtError::GetDimensions)?;
-
-    Ok(node_dims)
-}
-
-pub(crate) fn get_tensor_element_type(
-    tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo,
-) -> Result<TensorElementDataType> {
-    let mut type_sys = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-    let status = unsafe { g_ort().GetTensorElementType.unwrap()(tensor_info_ptr, &mut type_sys) };
-    status_to_result(status).map_err(OrtError::GetTensorElementType)?;
-    (type_sys != sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED)
-        .then(|| ())
-        .ok_or(OrtError::UndefinedTensorElementType)?;
-
-    Ok(unsafe { std::mem::transmute(type_sys) })
 }
 
 /// This module contains dangerous functions working on raw pointers.
 /// Those functions are only to be used from inside the
 /// `SessionBuilder::with_model_from_file()` method.
 mod dangerous {
+    use crate::ort_tensor_type_and_shape_info::OrtTensorTypeAndShapeInfo;
+
     use super::*;
 
     pub(super) fn extract_inputs_count(session_ptr: *mut sys::OrtSession) -> Result<usize> {
@@ -1402,7 +1033,7 @@ mod dangerous {
         let status = unsafe { f(session_ptr, &mut num_nodes) };
         status_to_result(status).map_err(OrtError::InOutCount)?;
         assert_null_pointer(status, "SessionStatus")?;
-        (num_nodes != 0).then(|| ()).ok_or_else(|| {
+        (num_nodes != 0).then_some(()).ok_or_else(|| {
             OrtError::InOutCount(OrtApiError::Msg("No nodes in model".to_owned()))
         })?;
         Ok(num_nodes)
@@ -1488,14 +1119,14 @@ mod dangerous {
         status_to_result(status).map_err(OrtError::CastTypeInfoToTensorInfo)?;
         assert_not_null_pointer(tensor_info_ptr, "TensorInfo")?;
 
-        let tensor_dimensions = get_tensor_dimensions(tensor_info_ptr)?;
-        let tensor_element_type = get_tensor_element_type(tensor_info_ptr)?;
-
-        unsafe { g_ort().ReleaseTypeInfo.unwrap()(typeinfo_ptr) };
+        let type_and_shape_info: OrtTensorTypeAndShapeInfo =
+            (tensor_info_ptr as *mut sys::OrtTensorTypeAndShapeInfo).try_into()?;
 
         Ok((
-            tensor_element_type,
-            tensor_dimensions
+            type_and_shape_info.element_data_type.clone(),
+            type_and_shape_info
+                .dimensions
+                .clone()
                 .into_iter()
                 .map(|d| if d == -1 { None } else { Some(d as u32) })
                 .collect(),

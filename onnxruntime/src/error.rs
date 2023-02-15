@@ -1,10 +1,11 @@
 //! Module containing error definitions.
 
-use crate::{char_p_to_string, g_ort};
+use crate::{char_p_to_string, g_ort, TensorElementDataType};
 use onnxruntime_sys as sys;
 use std::os::raw::c_char;
 use std::{io, path::PathBuf};
 use thiserror::Error;
+use tracing::error;
 
 /// Type alias for the `Result`
 pub type Result<T> = std::result::Result<T, OrtError>;
@@ -23,10 +24,12 @@ pub enum OrtError {
     /// Error occurred when releasing available providers
     #[error("Failed to release available providers: {0}")]
     ReleaseAvailableProviders(OrtApiError),
-    // FIXME: Move these to another enum (they are C API calls errors)
     /// An error occurred when creating an ONNX environment
     #[error("Failed to create environment: {0}")]
     Environment(OrtApiError),
+    /// An error occurred when creating an ONNX environment
+    #[error("Failed to create environment: {0}")]
+    ThreadingOptions(OrtApiError),
     /// Error occurred when creating an ONNX session options
     #[error("Failed to create session options: {0}")]
     SessionOptions(OrtApiError),
@@ -66,6 +69,9 @@ pub enum OrtError {
     /// Error occurred when creating memory information
     #[error("Failed to get create memory information: {0}")]
     CreateMemoryInfo(OrtApiError),
+    /// Error occurred when getting memory information
+    #[error("Failed to get memory information: {0}")]
+    GetTensorMemoryInfo(OrtApiError),
     /// Error occurred when geting name from memory information
     #[error("Failed to get memory information name: {0}")]
     MemoryInfoGetName(OrtApiError),
@@ -117,17 +123,12 @@ pub enum OrtError {
     /// Error occurred when extracting data from an ONNX tensor into an C array to be used as an `ndarray::ArrayView`
     #[error("Failed to get tensor data: {0}")]
     GetTensorMutableData(OrtApiError),
-
-    /// Error occurred when downloading a pre-trained ONNX model from the [ONNX Model Zoo](https://github.com/onnx/models)
-    #[error("Failed to download ONNX model: {0}")]
-    DownloadError(#[from] OrtDownloadError),
-
-    /// Dimensions of input data and ONNX model loaded from file do not match
-    #[error("Dimensions do not match: {0:?}")]
-    NonMatchingDimensions(NonMatchingDimensionsError),
+    /// Data type of input data and ONNX model loaded from file do not match
+    #[error("Data type does not match: {0}")]
+    NonMachingTypes(NonMatchingDataTypes),
     /// File does not exists
     #[error("File {filename:?} does not exists")]
-    FileDoesNotExists {
+    FileDoesNotExist {
         /// Path which does not exists
         filename: PathBuf,
     },
@@ -152,35 +153,22 @@ pub enum OrtError {
     /// The runtime type was undefined
     #[error("Undefined Tensor Element Type")]
     UndefinedTensorElementType,
-    /// Error occurred when checking if ONNX tensor was properly initialized
-    #[error("Failed to check if tensor")]
-    IsTensorCheck,
+    /// The OrtValue is not of type Tensor
+    #[error("OrtValue is not Tensor")]
+    NotTensor,
 }
 
 /// Error used when dimensions of input (from model and from inference call)
 /// do not match (as they should).
-#[non_exhaustive]
 #[derive(Error, Debug)]
-pub enum NonMatchingDimensionsError {
-    /// Number of inputs from model does not match number of inputs from inference call
-    #[error("Non-matching number of inputs: {inference_input_count:?} for input vs {model_input_count:?} for model (inputs: {inference_input:?}, model: {model_input:?})")]
-    InputsCount {
+pub enum NonMatchingDataTypes {
+    /// Requested data type for input does not match requested data type
+    #[error("Non-matching data types: {input:?} for input vs {requested:?}")]
+    DataType {
         /// Number of input dimensions used by inference call
-        inference_input_count: usize,
+        requested: TensorElementDataType,
         /// Number of input dimensions defined in model
-        model_input_count: usize,
-        /// Input dimensions used by inference call
-        inference_input: Vec<Vec<usize>>,
-        /// Input dimensions defined in model
-        model_input: Vec<Vec<Option<u32>>>,
-    },
-    /// Inputs length from model does not match the expected input from inference call
-    #[error("Different input lengths: Expected Input: {model_input:?} vs Received Input: {inference_input:?}")]
-    InputsLength {
-        /// Input dimensions used by inference call
-        inference_input: Vec<Vec<usize>>,
-        /// Input dimensions defined in model
-        model_input: Vec<Vec<Option<u32>>>,
+        input: TensorElementDataType,
     },
 }
 
@@ -223,32 +211,43 @@ pub enum OrtDownloadError {
 /// Wrapper type around a ONNX C API's `OrtStatus` pointer
 ///
 /// This wrapper exists to facilitate conversion from C raw pointers to Rust error types
-pub struct OrtStatusWrapper(*const sys::OrtStatus);
+#[derive(Debug)]
+pub struct OrtStatusWrapper {
+    ptr: *const sys::OrtStatus,
+}
+
+impl Drop for OrtStatusWrapper {
+    fn drop(&mut self) {
+        unsafe { g_ort().ReleaseStatus.unwrap()(self.ptr as *mut sys::OrtStatus) };
+
+        self.ptr = std::ptr::null_mut();
+    }
+}
 
 impl From<*const sys::OrtStatus> for OrtStatusWrapper {
     fn from(status: *const sys::OrtStatus) -> Self {
-        OrtStatusWrapper(status)
+        OrtStatusWrapper { ptr: status }
     }
 }
 
 pub(crate) fn assert_null_pointer<T>(ptr: *const T, name: &str) -> Result<()> {
     ptr.is_null()
-        .then(|| ())
+        .then_some(())
         .ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
 }
 
 pub(crate) fn assert_not_null_pointer<T>(ptr: *const T, name: &str) -> Result<()> {
     (!ptr.is_null())
-        .then(|| ())
+        .then_some(())
         .ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
 }
 
 impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
     fn from(status: OrtStatusWrapper) -> Self {
-        if status.0.is_null() {
+        if status.ptr.is_null() {
             Ok(())
         } else {
-            let raw: *const c_char = unsafe { g_ort().GetErrorMessage.unwrap()(status.0) };
+            let raw: *const c_char = unsafe { g_ort().GetErrorMessage.unwrap()(status.ptr) };
             match char_p_to_string(raw) {
                 Ok(msg) => Err(OrtApiError::Msg(msg)),
                 Err(err) => match err {
@@ -267,12 +266,4 @@ pub(crate) fn status_to_result(
 ) -> std::result::Result<(), OrtApiError> {
     let status_wrapper: OrtStatusWrapper = status.into();
     status_wrapper.into()
-}
-
-/// A wrapper around a function on OrtApi that maps the status code into [OrtApiError]
-pub(crate) unsafe fn call_ort<F>(mut f: F) -> std::result::Result<(), OrtApiError>
-where
-    F: FnMut(sys::OrtApi) -> *const sys::OrtStatus,
-{
-    status_to_result(f(g_ort()))
 }
