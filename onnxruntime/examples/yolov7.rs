@@ -69,9 +69,11 @@ fn run() -> Result<(), Error> {
         // .with_cuda(CUDAProviderOptions::default())?
         .with_optimization_level(GraphOptimizationLevel::All)?
         .with_inter_op_num_threads(16)?
-        .with_model_from_file("/workspaces/gstreamer/models/yolov7_onms_bN_fp32.onnx")?;
+        .with_model_from_file("./yolov7_onms_bN_fp32.onnx")?;
 
-    let img_raw = image::io::Reader::open("vehicle.jpg")?.decode()?.to_rgb8();
+    let img_raw = image::io::Reader::open("./vehicle.jpg")?
+        .decode()?
+        .to_rgb8();
     let (img, scale_x, scale_y) = resize_proportional(
         &img_raw,
         MODEL_WIDTH as u32,
