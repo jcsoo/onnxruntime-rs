@@ -1,0 +1,26 @@
+{
+	"name": "Rust",
+	"dockerFile": "Dockerfile",
+	"runArgs": [
+		"--runtime=nvidia",
+		"-v/dev/shm:/dev/shm",
+		"--gpus=all"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"serayuzgur.crates",
+				"tamasfe.even-better-toml",
+				"vadimcn.vscode-lldb"
+			]
+		},
+		"settings": {
+			"lldb.executable": "/usr/bin/lldb",
+			"files.watcherExclude": {
+				"**/target/**": true
+			},
+			"rust-analyzer.checkOnSave.command": "clippy"
+		}
+	}
+}
