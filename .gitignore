@@ -7,3 +7,4 @@ Cargo.lock
 **/synset.txt
 
 /.idea
+.DS_Store

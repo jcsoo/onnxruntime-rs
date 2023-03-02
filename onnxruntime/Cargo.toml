@@ -14,10 +14,6 @@ repository = "https://github.com/nbigaouette/onnxruntime-rs"
 categories = ["science"]
 keywords = ["neuralnetworks", "onnx", "bindings"]
 
-[[test]]
-name = "integration_tests"
-required-features = ["model-fetching"]
-
 [dependencies]
 half = "2.2.1"
 lazy_static = "1.4.0"
@@ -29,11 +25,9 @@ tracing = "0.1.37"
 [dev-dependencies]
 image = "0.24.5"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+ndarray-rand = "0.14.0"
 
 [features]
 default = ["cuda"]
 cuda = ["onnxruntime-sys/cuda"]
 ort_1_14_0 = []
-
-[package.metadata.docs.rs]
-features = ["disable-sys-build-script", "model-fetching"]

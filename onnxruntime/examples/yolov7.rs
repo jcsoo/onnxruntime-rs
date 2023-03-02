@@ -5,8 +5,8 @@ use image::{imageops, imageops::FilterType, GenericImage, GenericImageView, Imag
 use ndarray::{stack, Array3, Axis, ShapeBuilder};
 #[allow(unused_imports)]
 use onnxruntime::{
-    environment::Environment, ndarray::Array, CUDAProviderOptions, GraphOptimizationLevel,
-    LoggingLevel, OrtValue, TensorrtProviderOptions,
+    ndarray::Array, CUDAProviderOptions, Environment, GraphOptimizationLevel, LoggingLevel,
+    TensorrtProviderOptions, Value,
 };
 use std::collections::HashMap;
 use std::fs::File;

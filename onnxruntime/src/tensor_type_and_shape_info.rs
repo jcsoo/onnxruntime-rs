@@ -1,25 +1,29 @@
-use crate::error::{status_to_result, OrtError, Result};
-use crate::{g_ort, OrtValue, TensorElementDataType};
+//! Module abstracting OrtTensorTypeAndShapeInfo.
+
+use crate::{
+    error::{OrtError, Result},
+    g_ort, status_to_result, TensorElementDataType, Value,
+};
 use onnxruntime_sys as sys;
 use std::fmt::Debug;
 use tracing::{error, trace};
 
 #[derive(Debug)]
 /// A tensor’s type and shape information.
-pub struct OrtTensorTypeAndShapeInfo {
+pub struct TensorTypeAndShapeInfo {
     ptr: *mut sys::OrtTensorTypeAndShapeInfo,
-    /// The Tensory Data Type
+    /// The Tensor Data Type
     pub element_data_type: TensorElementDataType,
     /// The shape of the Tensor
     pub dimensions: Vec<i64>,
 }
 
-impl TryFrom<*mut sys::OrtTensorTypeAndShapeInfo> for OrtTensorTypeAndShapeInfo {
+impl TryFrom<*mut sys::OrtTensorTypeAndShapeInfo> for TensorTypeAndShapeInfo {
     type Error = OrtError;
 
     fn try_from(ptr: *mut sys::OrtTensorTypeAndShapeInfo) -> Result<Self> {
-        let element_data_type = OrtTensorTypeAndShapeInfo::try_get_data_type(ptr)?;
-        let dimensions = OrtTensorTypeAndShapeInfo::try_get_dimensions(ptr)?;
+        let element_data_type = TensorTypeAndShapeInfo::try_get_data_type(ptr)?;
+        let dimensions = TensorTypeAndShapeInfo::try_get_dimensions(ptr)?;
 
         Ok(Self {
             ptr,
@@ -29,10 +33,8 @@ impl TryFrom<*mut sys::OrtTensorTypeAndShapeInfo> for OrtTensorTypeAndShapeInfo 
     }
 }
 
-impl OrtTensorTypeAndShapeInfo {
-    pub(crate) fn try_new(ort_value: &OrtValue) -> Result<Self> {
-        trace!("Creating OrtTensorTypeAndShapeInfo.");
-
+impl TensorTypeAndShapeInfo {
+    pub(crate) fn try_new(ort_value: &Value) -> Result<Self> {
         // ensure tensor
         ort_value
             .is_tensor()?
@@ -46,6 +48,7 @@ impl OrtTensorTypeAndShapeInfo {
             .map_err(OrtError::GetTensorTypeAndShape)
             .unwrap();
 
+        trace!("Created TensorTypeAndShapeInfo: {ptr:?}.");
         ptr.try_into()
     }
 
@@ -86,13 +89,13 @@ impl OrtTensorTypeAndShapeInfo {
     }
 }
 
-impl Drop for OrtTensorTypeAndShapeInfo {
+impl Drop for TensorTypeAndShapeInfo {
     #[tracing::instrument]
     fn drop(&mut self) {
         if self.ptr.is_null() {
-            error!("OrtTensorTypeAndShapeInfo pointer is null, not dropping.");
+            error!("TensorTypeAndShapeInfo pointer is null, not dropping.");
         } else {
-            trace!("Dropping OrtTensorTypeAndShapeInfo: {:?}.", self.ptr);
+            trace!("Dropping TensorTypeAndShapeInfo: {:?}.", self.ptr);
             unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(self.ptr) };
         }
 

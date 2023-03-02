@@ -56,35 +56,6 @@
 //! # }
 //! ```
 //!
-#![cfg_attr(
-    feature = "model-fetching",
-    doc = r##"
-Instead of loading a model from file using [`with_model_from_file()`](session/struct.SessionBuilder.html#method.with_model_from_file),
-a model can be fetched directly from the [ONNX Model Zoo](https://github.com/onnx/models) using
-[`with_model_downloaded()`](session/struct.SessionBuilder.html#method.with_model_downloaded) method
-(requires the `model-fetching` feature).
-
-```no_run
-# use std::error::Error;
-# use onnxruntime::{environment::Environment, download::vision::ImageClassification, LoggingLevel, GraphOptimizationLevel};
-# fn main() -> Result<(), Box<dyn Error>> {
-# let environment = Environment::builder()
-#     .with_name("test")
-#     .with_log_level(LoggingLevel::Verbose)
-#     .build()?;
-let mut session = environment
-    .new_session_builder()?
-    .with_optimization_level(GraphOptimizationLevel::Basic)?
-    .with_number_threads(1)?
-    .with_model_downloaded(ImageClassification::SqueezeNet)?;
-# Ok(())
-# }
-```
-
-See [`AvailableOnnxModel`](download/enum.AvailableOnnxModel.html) for the different models available
-to download.
-"##
-)]
 //!
 //! Inference will be run on data passed as an [`ndarray::Array`](https://docs.rs/ndarray/latest/ndarray/type.Array.html).
 //!
@@ -118,6 +89,7 @@ to download.
 use half::f16;
 use lazy_static::lazy_static;
 use onnxruntime_sys as sys;
+use status::Status;
 use std::os::raw::c_char;
 use std::sync::{atomic::AtomicPtr, Arc, Mutex};
 
@@ -141,38 +113,37 @@ macro_rules! extern_system_fn {
     ($(#[$meta:meta])* $vis:vis unsafe fn $($tt:tt)*) => ($(#[$meta])* $vis unsafe extern "C" fn $($tt)*);
 }
 
+pub mod allocator;
 pub mod environment;
 pub mod error;
 pub mod io_binding;
 pub mod memory_info;
-mod ort_tensor_type_and_shape_info;
-pub mod ort_value;
 pub mod session;
+pub mod status;
+pub mod tensor_type_and_shape_info;
+pub mod value;
 
 // Re-export
-use crate::error::{assert_not_null_pointer, status_to_result};
+pub use allocator::AllocatorType;
 pub use environment::Environment;
 pub use error::{OrtApiError, OrtError, Result};
 pub use memory_info::MemoryInfo;
 #[cfg(feature = "cuda")]
 pub use session::{CUDAProviderOptions, TensorrtProviderOptions};
 pub use session::{ExecutionMode, Input, Output, Session};
+pub use tensor_type_and_shape_info::TensorTypeAndShapeInfo;
 
 // Re-export ndarray as it's part of the public API anyway
 pub use ndarray;
-pub use ort_value::OrtValue;
 use std::ffi::CString;
 use std::fmt::Debug;
+pub use value::Value;
 
 lazy_static! {
-    // static ref G_ORT: Arc<Mutex<AtomicPtr<sys::OrtApi>>> =
-    //     Arc::new(Mutex::new(AtomicPtr::new(unsafe {
-    //         sys::OrtGetApiBase().as_ref().unwrap().GetApi.unwrap()(sys::ORT_API_VERSION)
-    //     } as *mut sys::OrtApi)));
     static ref G_ORT_API: Arc<Mutex<AtomicPtr<sys::OrtApi>>> = {
         let base: *const sys::OrtApiBase = unsafe { sys::OrtGetApiBase() };
         assert_ne!(base, std::ptr::null());
-        let get_api: extern_system_fn!{ unsafe fn(u32) -> *const onnxruntime_sys::OrtApi } =
+        let get_api: extern_system_fn! { unsafe fn(u32) -> *const onnxruntime_sys::OrtApi } =
             unsafe { (*base).GetApi.unwrap() };
         let api: *const sys::OrtApi = unsafe { get_api(sys::ORT_API_VERSION) };
         Arc::new(Mutex::new(AtomicPtr::new(api as *mut sys::OrtApi)))
@@ -191,7 +162,7 @@ fn g_ort() -> sys::OrtApi {
     unsafe { *api_ptr_mut }
 }
 
-fn char_p_to_string(raw: *const c_char) -> Result<String> {
+fn char_ptr_to_string(raw: *const c_char) -> Result<String> {
     let c_string = unsafe { std::ffi::CStr::from_ptr(raw as *mut c_char).to_owned() };
 
     match c_string.into_string() {
@@ -201,6 +172,25 @@ fn char_p_to_string(raw: *const c_char) -> Result<String> {
     .map_err(OrtError::StringConversion)
 }
 
+pub(crate) fn assert_null_pointer<T>(ptr: *const T, name: &str) -> Result<()> {
+    ptr.is_null()
+        .then_some(())
+        .ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
+}
+
+pub(crate) fn assert_not_null_pointer<T>(ptr: *const T, name: &str) -> Result<()> {
+    (!ptr.is_null())
+        .then_some(())
+        .ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
+}
+
+pub(crate) fn status_to_result(
+    status: *const sys::OrtStatus,
+) -> std::result::Result<(), OrtApiError> {
+    let status = Status::from(status);
+    status.into()
+}
+
 /// Get the names of all available providers
 pub fn get_available_providers() -> Result<Vec<String>> {
     let mut out_ptr: *mut *mut c_char = vec![std::ptr::null_mut()].as_mut_ptr();
@@ -208,6 +198,7 @@ pub fn get_available_providers() -> Result<Vec<String>> {
 
     let status =
         unsafe { g_ort().GetAvailableProviders.unwrap()(&mut out_ptr, &mut provider_length) };
+
     status_to_result(status).map_err(OrtError::GetAvailableProviders)?;
     assert_not_null_pointer(out_ptr, "GetAvailableProviders")?;
 
@@ -398,8 +389,16 @@ pub enum DeviceName {
     Cuda,
     /// CudaPinned
     CudaPinned,
+    /// Cann
+    Cann,
+    /// CannPinned
+    CannPinned,
     /// Dml
     Dml,
+    /// Hip
+    Hip,
+    /// HipPinned
+    HipPinned,
     /// OpenVinoCpu
     OpenVinoCpu,
     /// OpenVinoGpu
@@ -412,7 +411,11 @@ impl From<DeviceName> for CString {
             DeviceName::Cpu => CString::new("Cpu").unwrap(),
             DeviceName::Cuda => CString::new("Cuda").unwrap(),
             DeviceName::CudaPinned => CString::new("CudaPinned").unwrap(),
+            DeviceName::Cann => CString::new("Cann").unwrap(),
+            DeviceName::CannPinned => CString::new("CannPinned").unwrap(),
             DeviceName::Dml => CString::new("DML").unwrap(),
+            DeviceName::Hip => CString::new("Hip").unwrap(),
+            DeviceName::HipPinned => CString::new("HipPinned").unwrap(),
             DeviceName::OpenVinoCpu => CString::new("OpenVINO_CPU").unwrap(),
             DeviceName::OpenVinoGpu => CString::new("OpenVINO_GPU").unwrap(),
         }
@@ -423,12 +426,18 @@ impl From<&str> for DeviceName {
     fn from(val: &str) -> Self {
         match val {
             "Cpu" => DeviceName::Cpu,
+            // not sure why this value exists
+            "CUDA_CPU" => DeviceName::Cpu,
             "Cuda" => DeviceName::Cuda,
             "CudaPinned" => DeviceName::CudaPinned,
+            "Cann" => DeviceName::Cuda,
+            "CannPinned" => DeviceName::CudaPinned,
             "Dml" => DeviceName::Dml,
+            "Hip" => DeviceName::Hip,
+            "HipPinned" => DeviceName::HipPinned,
             "OpenVINO_CPU" => DeviceName::OpenVinoCpu,
             "OpenVINO_GPU" => DeviceName::OpenVinoGpu,
-            _ => todo!(),
+            other => unimplemented!("{other:?} not implemented"),
         }
     }
 }
@@ -609,38 +618,6 @@ impl<T: Utf8Data> TypeToTensorElementDataType for T {
     }
 }
 
-/// Allocator type
-#[derive(Debug, Clone)]
-#[repr(i32)]
-pub enum AllocatorType {
-    /// Invalid allocator
-    Invalid,
-    /// Device allocator
-    Device,
-    /// Arena allocator
-    Arena,
-}
-
-impl From<AllocatorType> for sys::OrtAllocatorType {
-    fn from(val: AllocatorType) -> Self {
-        match val {
-            AllocatorType::Invalid => sys::OrtAllocatorType::OrtInvalidAllocator,
-            AllocatorType::Device => sys::OrtAllocatorType::OrtDeviceAllocator,
-            AllocatorType::Arena => sys::OrtAllocatorType::OrtArenaAllocator,
-        }
-    }
-}
-
-impl From<sys::OrtAllocatorType> for AllocatorType {
-    fn from(val: sys::OrtAllocatorType) -> Self {
-        match val {
-            sys::OrtAllocatorType::OrtInvalidAllocator => AllocatorType::Invalid,
-            sys::OrtAllocatorType::OrtDeviceAllocator => AllocatorType::Device,
-            sys::OrtAllocatorType::OrtArenaAllocator => AllocatorType::Arena,
-        }
-    }
-}
-
 /// Memory type
 ///
 /// Only support ONNX's default type for now.
@@ -680,10 +657,10 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_char_p_to_string() {
+    fn test_char_ptr_to_string() {
         let s = std::ffi::CString::new("foo").unwrap();
         let ptr = s.as_c_str().as_ptr();
-        assert_eq!("foo", char_p_to_string(ptr).unwrap());
+        assert_eq!("foo", char_ptr_to_string(ptr).unwrap());
     }
 
     #[test]

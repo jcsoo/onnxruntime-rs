@@ -1,21 +1,19 @@
 //! Module containing session types
 
 use crate::{
-    char_p_to_string,
+    allocator::Allocator,
+    assert_not_null_pointer, assert_null_pointer, char_ptr_to_string,
     environment::Environment,
-    error::{
-        assert_not_null_pointer, assert_null_pointer, status_to_result, OrtApiError, OrtError,
-        Result,
-    },
+    error::{OrtApiError, OrtError, Result},
     g_ort,
     io_binding::IoBinding,
     memory_info::MemoryInfo,
-    AllocatorType, DeviceName, GraphOptimizationLevel, MemType, OrtValue, TensorElementDataType,
+    status_to_result, AllocatorType, DeviceName, GraphOptimizationLevel, MemType,
+    TensorElementDataType, Value,
 };
 use onnxruntime_sys as sys;
-use std::collections::HashMap;
 use std::os::raw::c_char;
-use std::os::unix::ffi::OsStrExt;
+use std::{collections::HashMap, io::Read};
 use std::{ffi::CString, fmt::Debug, path::Path};
 use tracing::{error, trace};
 
@@ -52,7 +50,6 @@ use tracing::{error, trace};
 pub struct SessionBuilder<'e> {
     env: &'e Environment,
     session_options_ptr: *mut sys::OrtSessionOptions,
-
     allocator: AllocatorType,
     memory_type: MemType,
 }
@@ -198,8 +195,8 @@ impl<'e> SessionBuilder<'e> {
         unsafe {
             let mut cuda_options_ptr: *mut sys::OrtCUDAProviderOptionsV2 = std::ptr::null_mut();
             let status = g_ort().CreateCUDAProviderOptions.unwrap()(&mut cuda_options_ptr);
-            status_to_result(status).map_err(OrtError::Allocator)?;
-            assert_not_null_pointer(cuda_options_ptr, "OrtCUDAProviderOptionsV2")?;
+            status_to_result(status).map_err(OrtError::CreateCUDAProviderOptions)?;
+            assert_not_null_pointer(cuda_options_ptr, "CreateCUDAProviderOptions")?;
 
             let (keys, values) = options.get_keys_values();
 
@@ -213,13 +210,14 @@ impl<'e> SessionBuilder<'e> {
                     .as_ptr(),
                 keys.len(),
             );
-            status_to_result(status).map_err(OrtError::Allocator)?;
+            status_to_result(status).map_err(OrtError::UpdateCUDAProviderOptions)?;
 
             let status = g_ort()
                 .SessionOptionsAppendExecutionProvider_CUDA_V2
                 .unwrap()(self.session_options_ptr, cuda_options_ptr);
 
-            status_to_result(status).map_err(OrtError::Allocator)?;
+            status_to_result(status)
+                .map_err(OrtError::SessionOptionsAppendExecutionProviderCudaV2)?;
 
             g_ort().ReleaseCUDAProviderOptions.unwrap()(cuda_options_ptr);
         }
@@ -286,7 +284,6 @@ impl<'e> SessionBuilder<'e> {
         P: AsRef<Path> + Debug + 'e,
     {
         let model_filepath = model_filepath_ref.as_ref();
-        let mut session_ptr: *mut sys::OrtSession = std::ptr::null_mut();
 
         if !model_filepath.exists() {
             return Err(OrtError::FileDoesNotExist {
@@ -294,63 +291,20 @@ impl<'e> SessionBuilder<'e> {
             });
         }
 
-        // Build an OsString than a vector of bytes to pass to C
-        let model_path = std::ffi::OsString::from(model_filepath);
-        let model_path: Vec<std::os::raw::c_char> = model_path
-            .as_bytes()
-            .iter()
-            .chain(std::iter::once(&b'\0')) // Make sure we have a null terminated string
-            .map(|b| *b as std::os::raw::c_char)
-            .collect();
+        let mut onnx_file =
+            std::fs::File::open(model_filepath).map_err(|err| OrtError::FileRead {
+                filename: model_filepath.to_path_buf(),
+                err,
+            })?;
+        let mut model = Vec::new();
+        onnx_file
+            .read_to_end(&mut model)
+            .map_err(|err| OrtError::FileRead {
+                filename: model_filepath.to_path_buf(),
+                err,
+            })?;
 
-        let env_ptr: *const sys::OrtEnv = self.env.env_ptr();
-
-        let status = unsafe {
-            g_ort().CreateSession.unwrap()(
-                env_ptr,
-                model_path.as_ptr(),
-                self.session_options_ptr,
-                &mut session_ptr,
-            )
-        };
-        status_to_result(status).map_err(OrtError::Session)?;
-        assert_null_pointer(status, "SessionStatus")?;
-        assert_not_null_pointer(session_ptr, "Session")?;
-
-        let mut allocator_ptr: *mut sys::OrtAllocator = std::ptr::null_mut();
-        let status = unsafe { g_ort().GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr) };
-        status_to_result(status).map_err(OrtError::Allocator)?;
-        assert_null_pointer(status, "SessionStatus")?;
-        assert_not_null_pointer(allocator_ptr, "Allocator")?;
-
-        let memory_info =
-            MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default)?;
-
-        // Extract input and output properties
-        let num_input_nodes = dangerous::extract_inputs_count(session_ptr)?;
-        let num_output_nodes = dangerous::extract_outputs_count(session_ptr)?;
-        let inputs = (0..num_input_nodes)
-            .map(|i| {
-                let input = dangerous::extract_input(session_ptr, allocator_ptr, i)?;
-                Ok((input.name.clone(), input))
-            })
-            .collect::<Result<HashMap<String, Input>>>()?;
-        let outputs = (0..num_output_nodes)
-            .map(|i| {
-                let output = dangerous::extract_output(session_ptr, allocator_ptr, i)?;
-                Ok((output.name.clone(), output))
-            })
-            .collect::<Result<HashMap<String, Output>>>()?;
-
-        trace!("Creating Session.");
-        Ok(Session {
-            env: self.env,
-            ptr: session_ptr,
-            allocator_ptr,
-            memory_info,
-            inputs,
-            outputs,
-        })
+        self.with_model_from_memory(&model)
     }
 
     /// Load an ONNX graph from memory and commit the session
@@ -366,7 +320,7 @@ impl<'e> SessionBuilder<'e> {
     fn with_model_from_memory_monomorphized(self, model_bytes: &[u8]) -> Result<Session<'e>> {
         let mut session_ptr: *mut sys::OrtSession = std::ptr::null_mut();
 
-        let env_ptr: *const sys::OrtEnv = self.env.env_ptr();
+        let env_ptr: *const sys::OrtEnv = self.env.ptr();
 
         let status = unsafe {
             let model_data = model_bytes.as_ptr() as *const std::ffi::c_void;
@@ -383,11 +337,7 @@ impl<'e> SessionBuilder<'e> {
         assert_null_pointer(status, "SessionStatus")?;
         assert_not_null_pointer(session_ptr, "Session")?;
 
-        let mut allocator_ptr: *mut sys::OrtAllocator = std::ptr::null_mut();
-        let status = unsafe { g_ort().GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr) };
-        status_to_result(status).map_err(OrtError::Allocator)?;
-        assert_null_pointer(status, "SessionStatus")?;
-        assert_not_null_pointer(allocator_ptr, "Allocator")?;
+        let allocator = Allocator::try_new()?;
 
         let memory_info =
             MemoryInfo::new(DeviceName::Cpu, 0, AllocatorType::Arena, MemType::Default)?;
@@ -397,22 +347,22 @@ impl<'e> SessionBuilder<'e> {
         let num_output_nodes = dangerous::extract_outputs_count(session_ptr)?;
         let inputs = (0..num_input_nodes)
             .map(|i| {
-                let input = dangerous::extract_input(session_ptr, allocator_ptr, i)?;
+                let input = dangerous::extract_input(session_ptr, allocator.ptr, i)?;
                 Ok((input.name.clone(), input))
             })
             .collect::<Result<HashMap<String, Input>>>()?;
         let outputs = (0..num_output_nodes)
             .map(|i| {
-                let output = dangerous::extract_output(session_ptr, allocator_ptr, i)?;
+                let output = dangerous::extract_output(session_ptr, allocator.ptr, i)?;
                 Ok((output.name.clone(), output))
             })
             .collect::<Result<HashMap<String, Output>>>()?;
 
-        trace!("Creating Session.");
+        trace!("Created Session: {session_ptr:?}");
         Ok(Session {
             env: self.env,
             ptr: session_ptr,
-            allocator_ptr,
+            allocator,
             memory_info,
             inputs,
             outputs,
@@ -853,7 +803,7 @@ impl TensorrtProviderOptions {
 pub struct Session<'e> {
     env: &'e Environment,
     pub(crate) ptr: *mut sys::OrtSession,
-    pub(crate) allocator_ptr: *mut sys::OrtAllocator,
+    pub(crate) allocator: Allocator,
     pub(crate) memory_info: MemoryInfo,
     /// Information about the ONNX's inputs as stored in loaded file
     pub inputs: HashMap<String, Input>,
@@ -923,7 +873,6 @@ impl<'e> Drop for Session<'e> {
         }
 
         self.ptr = std::ptr::null_mut();
-        self.allocator_ptr = std::ptr::null_mut();
     }
 }
 
@@ -935,8 +884,8 @@ impl<'e> Session<'e> {
     #[tracing::instrument]
     pub fn run<'s, 't, 'm, S>(
         &'s self,
-        inputs: HashMap<S, &OrtValue>,
-    ) -> Result<HashMap<String, OrtValue>>
+        inputs: HashMap<S, &Value>,
+    ) -> Result<HashMap<String, Value>>
     where
         'm: 't, // 'm outlives 't (memory info outlives tensor)
         's: 'm, // 's outlives 'm (session outlives memory info)
@@ -1011,7 +960,7 @@ impl<'e> Session<'e> {
 /// Those functions are only to be used from inside the
 /// `SessionBuilder::with_model_from_file()` method.
 mod dangerous {
-    use crate::ort_tensor_type_and_shape_info::OrtTensorTypeAndShapeInfo;
+    use crate::tensor_type_and_shape_info::TensorTypeAndShapeInfo;
 
     use super::*;
 
@@ -1059,13 +1008,21 @@ mod dangerous {
         allocator_ptr: *mut sys::OrtAllocator,
         i: usize,
     ) -> Result<String> {
-        let mut name_bytes: *mut c_char = std::ptr::null_mut();
+        let mut name_ptr: *mut c_char = std::ptr::null_mut();
         let status = unsafe {
-            g_ort().SessionGetInputName.unwrap()(session_ptr, i, allocator_ptr, &mut name_bytes)
+            g_ort().SessionGetInputName.unwrap()(session_ptr, i, allocator_ptr, &mut name_ptr)
         };
         status_to_result(status).map_err(OrtError::SessionGetInputName)?;
-        assert_not_null_pointer(name_bytes, "SessionGetInputName")?;
-        char_p_to_string(name_bytes)
+        assert_not_null_pointer(name_ptr, "SessionGetInputName")?;
+
+        let input_name = char_ptr_to_string(name_ptr)?;
+
+        let status = unsafe {
+            g_ort().AllocatorFree.unwrap()(allocator_ptr, name_ptr as *mut std::ffi::c_void)
+        };
+        status_to_result(status).map_err(OrtError::AllocatorFree)?;
+
+        Ok(input_name)
     }
 
     fn extract_output_name(
@@ -1073,13 +1030,21 @@ mod dangerous {
         allocator_ptr: *mut sys::OrtAllocator,
         i: usize,
     ) -> Result<String> {
-        let mut name_bytes: *mut c_char = std::ptr::null_mut();
+        let mut name_ptr: *mut c_char = std::ptr::null_mut();
         let status = unsafe {
-            g_ort().SessionGetOutputName.unwrap()(session_ptr, i, allocator_ptr, &mut name_bytes)
+            g_ort().SessionGetOutputName.unwrap()(session_ptr, i, allocator_ptr, &mut name_ptr)
         };
         status_to_result(status).map_err(OrtError::SessionGetOutputName)?;
-        assert_not_null_pointer(name_bytes, "SessionGetOutputName")?;
-        char_p_to_string(name_bytes)
+        assert_not_null_pointer(name_ptr, "SessionGetOutputName")?;
+
+        let output_name = char_ptr_to_string(name_ptr)?;
+
+        let status = unsafe {
+            g_ort().AllocatorFree.unwrap()(allocator_ptr, name_ptr as *mut std::ffi::c_void)
+        };
+        status_to_result(status).map_err(OrtError::AllocatorFree)?;
+
+        Ok(output_name)
     }
 
     pub(super) fn extract_output(
@@ -1119,7 +1084,7 @@ mod dangerous {
         status_to_result(status).map_err(OrtError::CastTypeInfoToTensorInfo)?;
         assert_not_null_pointer(tensor_info_ptr, "TensorInfo")?;
 
-        let type_and_shape_info: OrtTensorTypeAndShapeInfo =
+        let type_and_shape_info: TensorTypeAndShapeInfo =
             (tensor_info_ptr as *mut sys::OrtTensorTypeAndShapeInfo).try_into()?;
 
         Ok((

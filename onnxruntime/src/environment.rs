@@ -6,30 +6,30 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use onnxruntime_sys as sys;
 
 use crate::{
-    error::{status_to_result, OrtError, Result},
+    error::{OrtError, Result},
     g_ort,
     onnxruntime::custom_logger,
     session::SessionBuilder,
-    LoggingLevel,
+    status_to_result, LoggingLevel,
 };
 
 lazy_static! {
     static ref G_ENV: Arc<Mutex<EnvironmentSingleton>> =
         Arc::new(Mutex::new(EnvironmentSingleton {
             name: String::from("uninitialized"),
-            env_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
         }));
 }
 
 #[derive(Debug)]
 struct EnvironmentSingleton {
     name: String,
-    env_ptr: AtomicPtr<sys::OrtEnv>,
+    ptr: AtomicPtr<sys::OrtEnv>,
 }
 
 /// An [`Environment`](session/struct.Environment.html) is the main entry point of the ONNX Runtime.
@@ -80,8 +80,8 @@ impl Environment {
         self.env.lock().unwrap().name.to_string()
     }
 
-    pub(crate) fn env_ptr(&self) -> *const sys::OrtEnv {
-        *self.env.lock().unwrap().env_ptr.get_mut()
+    pub(crate) fn ptr(&self) -> *const sys::OrtEnv {
+        *self.env.lock().unwrap().ptr.get_mut()
     }
 
     #[tracing::instrument]
@@ -93,9 +93,9 @@ impl Environment {
         let mut environment_guard = G_ENV
             .lock()
             .expect("Failed to acquire lock: another thread panicked?");
-        let g_env_ptr = environment_guard.env_ptr.get_mut();
+        let g_env_ptr = environment_guard.ptr.get_mut();
         if g_env_ptr.is_null() {
-            debug!("Environment not yet initialized, creating a new one.");
+            trace!("Environment not yet initialized, creating a new one.");
 
             let mut threading_options_ptr: *mut sys::OrtThreadingOptions = std::ptr::null_mut();
             let status =
@@ -160,11 +160,6 @@ impl Environment {
             let status = { unsafe { g_ort().DisableTelemetryEvents.unwrap()(env_ptr) } };
             status_to_result(status).map_err(OrtError::Environment)?;
 
-            debug!(
-                env_ptr = format!("{env_ptr:?}").as_str(),
-                "Environment created."
-            );
-
             *g_env_ptr = env_ptr;
             environment_guard.name = builder.name.clone();
 
@@ -173,11 +168,12 @@ impl Environment {
             //       will be 2:
             //          * one lazy_static 'G_ENV'
             //          * one inside the 'Environment' returned
+            trace!("Created Environment: {env_ptr:?}.");
             Ok(Environment { env: G_ENV.clone() })
         } else {
             info!(
                 name = environment_guard.name.as_str(),
-                env_ptr = format!("{:?}", environment_guard.env_ptr).as_str(),
+                ptr = format!("{:?}", environment_guard.ptr).as_str(),
                 "Environment already initialized, reusing it.",
             );
 
@@ -211,7 +207,7 @@ impl Drop for Environment {
         //       If there is no other environment, the strong count should be two and we
         //       can properly free the sys::OrtEnv pointer.
         if Arc::strong_count(&G_ENV) == 2 {
-            let ptr: *mut sys::OrtEnv = *environment_guard.env_ptr.get_mut();
+            let ptr: *mut sys::OrtEnv = *environment_guard.ptr.get_mut();
             if ptr.is_null() {
                 error!("Environment pointer is null, not dropping");
             } else {
@@ -219,7 +215,7 @@ impl Drop for Environment {
                 unsafe { g_ort().ReleaseEnv.unwrap()(ptr) };
             }
 
-            environment_guard.env_ptr = AtomicPtr::new(std::ptr::null_mut());
+            environment_guard.ptr = AtomicPtr::new(std::ptr::null_mut());
             environment_guard.name = String::from("uninitialized");
         }
     }
@@ -302,8 +298,8 @@ mod tests {
             Arc::strong_count(self) >= 2
         }
 
-        fn env_ptr(&self) -> *const sys::OrtEnv {
-            *self.lock().unwrap().env_ptr.get_mut()
+        fn ptr(&self) -> *const sys::OrtEnv {
+            *self.lock().unwrap().ptr.get_mut()
         }
     }
 
@@ -328,7 +324,7 @@ mod tests {
         let _run_lock = CONCURRENT_TEST_RUN.single_test_run();
 
         assert!(!G_ENV.is_initialized());
-        assert_eq!(G_ENV.env_ptr(), std::ptr::null_mut());
+        assert_eq!(G_ENV.ptr(), std::ptr::null_mut());
 
         let env = Environment::builder()
             .with_name("env_is_initialized")
@@ -336,11 +332,11 @@ mod tests {
             .build()
             .unwrap();
         assert!(G_ENV.is_initialized());
-        assert_ne!(G_ENV.env_ptr(), std::ptr::null_mut());
+        assert_ne!(G_ENV.ptr(), std::ptr::null_mut());
 
         std::mem::drop(env);
         assert!(!G_ENV.is_initialized());
-        assert_eq!(G_ENV.env_ptr(), std::ptr::null_mut());
+        assert_eq!(G_ENV.ptr(), std::ptr::null_mut());
     }
 
     #[ignore]
@@ -348,7 +344,7 @@ mod tests {
     fn sequential_environment_creation() {
         let _concurrent_run_lock_guard = CONCURRENT_TEST_RUN.single_test_run();
 
-        let mut prev_env_ptr = G_ENV.env_ptr();
+        let mut prev_env_ptr = G_ENV.ptr();
 
         for i in 0..10 {
             let name = format!("sequential_environment_creation: {i}");
@@ -357,7 +353,7 @@ mod tests {
                 .with_log_level(LoggingLevel::Warning)
                 .build()
                 .unwrap();
-            let next_env_ptr = G_ENV.env_ptr();
+            let next_env_ptr = G_ENV.ptr();
             assert_ne!(next_env_ptr, prev_env_ptr);
             prev_env_ptr = next_env_ptr;
 
@@ -375,7 +371,7 @@ mod tests {
             .with_log_level(LoggingLevel::Warning)
             .build()
             .unwrap();
-        let main_env_ptr = main_env.env_ptr() as usize;
+        let main_env_ptr = main_env.ptr() as usize;
 
         let children = (0..10).map(|t| {
             let initial_name_cloned = initial_name.clone();
@@ -388,12 +384,12 @@ mod tests {
                     .unwrap();
 
                 assert_eq!(env.name(), initial_name_cloned);
-                assert_eq!(env.env_ptr() as usize, main_env_ptr);
+                assert_eq!(env.ptr() as usize, main_env_ptr);
             })
         });
 
         assert_eq!(main_env.name(), initial_name);
-        assert_eq!(main_env.env_ptr() as usize, main_env_ptr);
+        assert_eq!(main_env.ptr() as usize, main_env_ptr);
 
         let res = children.into_iter().map(|child| child.join());
         assert!(res.into_iter().all(|r| std::result::Result::is_ok(&r)));

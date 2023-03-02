@@ -1,9 +1,7 @@
 //! Module containing error definitions.
 
-use crate::{char_p_to_string, g_ort, TensorElementDataType};
-use onnxruntime_sys as sys;
-use std::os::raw::c_char;
-use std::{io, path::PathBuf};
+use crate::{DeviceName, TensorElementDataType};
+use std::{path::PathBuf, str::Utf8Error};
 use thiserror::Error;
 use tracing::error;
 
@@ -39,6 +37,9 @@ pub enum OrtError {
     /// Error occurred when creating an ONNX allocator
     #[error("Failed to get allocator: {0}")]
     Allocator(OrtApiError),
+    /// Error occurred when trying to free a pointer using allocator
+    #[error("Failed to free using allocator: {0}")]
+    AllocatorFree(OrtApiError),
     /// Error occurred when counting ONNX input or output count
     #[error("Failed to get input or output count: {0}")]
     InOutCount(OrtApiError),
@@ -123,14 +124,25 @@ pub enum OrtError {
     /// Error occurred when extracting data from an ONNX tensor into an C array to be used as an `ndarray::ArrayView`
     #[error("Failed to get tensor data: {0}")]
     GetTensorMutableData(OrtApiError),
+    /// DeviceNames do not match
+    #[error("Failed to get tensor data: {0}")]
+    GetTensorMutableDataNonMatchingDeviceName(NonMatchingDeviceName),
     /// Data type of input data and ONNX model loaded from file do not match
     #[error("Data type does not match: {0}")]
     NonMachingTypes(NonMatchingDataTypes),
-    /// File does not exists
+    /// File does not exist
     #[error("File {filename:?} does not exists")]
     FileDoesNotExist {
         /// Path which does not exists
         filename: PathBuf,
+    },
+    /// File does not exist
+    #[error("File {filename:?} could not be read: {err}")]
+    FileRead {
+        /// Path which does not exists
+        filename: PathBuf,
+        /// Error
+        err: std::io::Error,
     },
     /// Path is an invalid UTF-8
     #[error("Path {path:?} cannot be converted to UTF-8")]
@@ -156,6 +168,21 @@ pub enum OrtError {
     /// The OrtValue is not of type Tensor
     #[error("OrtValue is not Tensor")]
     NotTensor,
+    #[cfg(feature = "cuda")]
+    /// The CreateCUDAProviderOptions call failed.
+    #[error("Failed to CreateCUDAProviderOptions: {0}")]
+    CreateCUDAProviderOptions(OrtApiError),
+    #[cfg(feature = "cuda")]
+    /// The UpdateCUDAProviderOptions call failed.
+    #[error("Failed to UpdateCUDAProviderOptions: {0}")]
+    UpdateCUDAProviderOptions(OrtApiError),
+    #[cfg(feature = "cuda")]
+    /// The SessionOptionsAppendExecutionProviderCudaV2 call failed.
+    #[error("Failed to SessionOptionsAppendExecutionProvider_CUDA_V2: {0}")]
+    SessionOptionsAppendExecutionProviderCudaV2(OrtApiError),
+    /// Details as reported by the FFI layer cannot be converted to UTF-8
+    #[error("Failed to convert CStr to UTF-8")]
+    IntoStringError(Utf8Error),
 }
 
 /// Error used when dimensions of input (from model and from inference call)
@@ -165,10 +192,23 @@ pub enum NonMatchingDataTypes {
     /// Requested data type for input does not match requested data type
     #[error("Non-matching data types: {input:?} for input vs {requested:?}")]
     DataType {
-        /// Number of input dimensions used by inference call
-        requested: TensorElementDataType,
         /// Number of input dimensions defined in model
         input: TensorElementDataType,
+        /// Number of input dimensions used by inference call
+        requested: TensorElementDataType,
+    },
+}
+
+/// Error used when device name does not match required
+#[derive(Error, Debug)]
+pub enum NonMatchingDeviceName {
+    /// Requested DeviceName does not match tensor DeviceName
+    #[error("Non-matching device: {tensor:?} for tensor vs {requested:?}")]
+    DeviceName {
+        /// The DeviceName of the tensor
+        tensor: DeviceName,
+        /// The requested DeviceName
+        requested: DeviceName,
     },
 }
 
@@ -182,88 +222,4 @@ pub enum OrtApiError {
     /// Details as reported by the ONNX C API in case of error cannot be converted to UTF-8
     #[error("Error calling ONNX Runtime C function and failed to convert error message to UTF-8")]
     IntoStringError(std::ffi::IntoStringError),
-}
-
-/// Error from downloading pre-trained model from the [ONNX Model Zoo](https://github.com/onnx/models).
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum OrtDownloadError {
-    /// Generic input/output error
-    #[error("Error downloading data to file: {0}")]
-    IoError(#[from] io::Error),
-    #[cfg(feature = "model-fetching")]
-    /// Download error by ureq
-    #[error("Error downloading data to file: {0}")]
-    UreqError(#[from] Box<ureq::Error>),
-    /// Error getting content-length from an HTTP GET request
-    #[error("Error getting content-length")]
-    ContentLengthError,
-    /// Mismatch between amount of downloaded and expected bytes
-    #[error("Error copying data to file: expected {expected} length, received {io}")]
-    CopyError {
-        /// Expected amount of bytes to download
-        expected: u64,
-        /// Number of bytes read from network and written to file
-        io: u64,
-    },
-}
-
-/// Wrapper type around a ONNX C API's `OrtStatus` pointer
-///
-/// This wrapper exists to facilitate conversion from C raw pointers to Rust error types
-#[derive(Debug)]
-pub struct OrtStatusWrapper {
-    ptr: *const sys::OrtStatus,
-}
-
-impl Drop for OrtStatusWrapper {
-    fn drop(&mut self) {
-        unsafe { g_ort().ReleaseStatus.unwrap()(self.ptr as *mut sys::OrtStatus) };
-
-        self.ptr = std::ptr::null_mut();
-    }
-}
-
-impl From<*const sys::OrtStatus> for OrtStatusWrapper {
-    fn from(status: *const sys::OrtStatus) -> Self {
-        OrtStatusWrapper { ptr: status }
-    }
-}
-
-pub(crate) fn assert_null_pointer<T>(ptr: *const T, name: &str) -> Result<()> {
-    ptr.is_null()
-        .then_some(())
-        .ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
-}
-
-pub(crate) fn assert_not_null_pointer<T>(ptr: *const T, name: &str) -> Result<()> {
-    (!ptr.is_null())
-        .then_some(())
-        .ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
-}
-
-impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
-    fn from(status: OrtStatusWrapper) -> Self {
-        if status.ptr.is_null() {
-            Ok(())
-        } else {
-            let raw: *const c_char = unsafe { g_ort().GetErrorMessage.unwrap()(status.ptr) };
-            match char_p_to_string(raw) {
-                Ok(msg) => Err(OrtApiError::Msg(msg)),
-                Err(err) => match err {
-                    OrtError::StringConversion(OrtApiError::IntoStringError(e)) => {
-                        Err(OrtApiError::IntoStringError(e))
-                    }
-                    _ => unreachable!(),
-                },
-            }
-        }
-    }
-}
-
-pub(crate) fn status_to_result(
-    status: *const sys::OrtStatus,
-) -> std::result::Result<(), OrtApiError> {
-    let status_wrapper: OrtStatusWrapper = status.into();
-    status_wrapper.into()
 }
