@@ -168,6 +168,13 @@ pub enum OrtError {
     /// The OrtValue is not of type Tensor
     #[error("OrtValue is not Tensor")]
     NotTensor,
+
+    #[cfg(feature = "coreml")]
+    /// The SessionOptionsAppendExecutionProviderCoreML call failed.
+    #[error("Failed to SessionOptionsAppendExecutionProvider_CoreML: {0}")]
+    SessionOptionsAppendExecutionProviderCoreML(OrtApiError),
+
+
     #[cfg(feature = "cuda")]
     /// The CreateCUDAProviderOptions call failed.
     #[error("Failed to CreateCUDAProviderOptions: {0}")]
@@ -176,6 +183,9 @@ pub enum OrtError {
     /// The UpdateCUDAProviderOptions call failed.
     #[error("Failed to UpdateCUDAProviderOptions: {0}")]
     UpdateCUDAProviderOptions(OrtApiError),
+
+
+
     #[cfg(feature = "cuda")]
     /// The SessionOptionsAppendExecutionProviderCudaV2 call failed.
     #[error("Failed to SessionOptionsAppendExecutionProvider_CUDA_V2: {0}")]

@@ -30,7 +30,18 @@ fn main() {
         .generate()
         .unwrap();
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(feature = "coreml")]
+    let bindings = bindgen::Builder::default()
+        .header("wrapper_coreml.h")
+        .clang_args(&[format!("-I{}", include_dir.display())])
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .size_t_is_usize(true)
+        .rustfmt_bindings(true)
+        .rustified_enum(".*")
+        .generate()
+        .unwrap();    
+
+    #[cfg(not(any(feature = "cuda", feature = "coreml")))]
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_args(&[format!("-I{}", include_dir.display())])

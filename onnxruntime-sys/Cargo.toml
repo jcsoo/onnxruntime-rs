@@ -17,5 +17,6 @@ repository = "https://github.com/nbigaouette/onnxruntime-rs"
 bindgen = "0.64.0"
 
 [features]
-default = ["cuda"]
+default = []
 cuda = []
+coreml = []

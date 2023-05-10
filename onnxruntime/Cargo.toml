@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 ndarray-rand = "0.14.0"
 
 [features]
-default = ["cuda"]
+default = []
 cuda = ["onnxruntime-sys/cuda"]
+coreml = ["onnxruntime-sys/coreml"]
 ort_1_14_0 = []

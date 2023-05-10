@@ -403,6 +403,8 @@ pub enum DeviceName {
     OpenVinoCpu,
     /// OpenVinoGpu
     OpenVinoGpu,
+    /// CoreML
+    CoreML,
 }
 
 impl From<DeviceName> for CString {
@@ -418,6 +420,7 @@ impl From<DeviceName> for CString {
             DeviceName::HipPinned => CString::new("HipPinned").unwrap(),
             DeviceName::OpenVinoCpu => CString::new("OpenVINO_CPU").unwrap(),
             DeviceName::OpenVinoGpu => CString::new("OpenVINO_GPU").unwrap(),
+            DeviceName::CoreML => CString::new("CoreML").unwrap(),
         }
     }
 }
@@ -437,6 +440,7 @@ impl From<&str> for DeviceName {
             "HipPinned" => DeviceName::HipPinned,
             "OpenVINO_CPU" => DeviceName::OpenVinoCpu,
             "OpenVINO_GPU" => DeviceName::OpenVinoGpu,
+            "CoreML" => DeviceName::CoreML,
             other => unimplemented!("{other:?} not implemented"),
         }
     }

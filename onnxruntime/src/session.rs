@@ -189,6 +189,21 @@ impl<'e> SessionBuilder<'e> {
         Ok(self)
     }
 
+    /// Set the session to use CoreML
+    #[cfg(feature = "coreml")]
+    pub fn with_coreml(self) -> Result<SessionBuilder<'e>> {
+        unsafe {
+            let status = sys::OrtSessionOptionsAppendExecutionProvider_CoreML(
+                self.session_options_ptr,
+                0x0,
+            );
+            status_to_result(status)
+                .map_err(OrtError::SessionOptionsAppendExecutionProviderCoreML)?;
+        };
+        Ok(self)
+    }
+
+
     /// Set the session to use cuda
     #[cfg(feature = "cuda")]
     pub fn with_cuda(self, options: CUDAProviderOptions) -> Result<SessionBuilder<'e>> {
@@ -543,6 +558,13 @@ pub enum CuDNNConvAlgoSearch {
     /// default algorithm using CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
     Default,
 }
+
+#[cfg(feature = "coreml")]
+#[derive(Debug, Clone)]
+/// Configuration options for the CoreML Execution Provider.
+pub struct CoreMLProviderOptions {
+}
+
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
