@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rustc-link-lib=onnxruntime");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=wrapper_coreml.h");
     println!("cargo:rerun-if-changed=wrapper_cuda.h");
     println!("cargo:rerun-if-env-changed=ORT_LIB_LOCATION");
     println!("cargo:rerun-if-changed={}", generated_file.display());
