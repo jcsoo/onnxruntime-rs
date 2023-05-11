@@ -18,7 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper_coreml.h");
     println!("cargo:rerun-if-changed=wrapper_cuda.h");
     println!("cargo:rerun-if-env-changed=ORT_LIB_LOCATION");
-    println!("cargo:rerun-if-changed={}", generated_file.display());
+    // println!("cargo:rerun-if-changed={}", generated_file.display());
 
     #[cfg(feature = "cuda")]
     let bindings = bindgen::Builder::default()
